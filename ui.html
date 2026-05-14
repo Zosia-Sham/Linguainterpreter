@@ -1,0 +1,1137 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>ML Orchestrator Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Tailwind via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: { brand: '#6d28d9' } } } }
+  </script>
+  <style>
+    .node-pill { font-size: 11px; padding: 2px 8px; border-radius: 9999px; }
+    .status-pending { background:#e5e7eb; color:#1f2937; }
+    .status-running { background:#dbeafe; color:#1e40af; }
+    .status-done    { background:#dcfce7; color:#166534; }
+    .status-failed  { background:#fee2e2; color:#991b1b; }
+    .btn { padding: 8px 12px; border-radius: 10px; border: 1px solid #e5e7eb; box-shadow: 0 1px 1px rgba(0,0,0,.03); }
+    .btn:hover { background:#f8fafc; }
+    .btn-primary { background:#6d28d9; color:#fff; border-color: transparent; }
+    .btn-primary:hover { opacity:.92; }
+    .btn-danger { background:#dc2626; color:#fff; border-color: transparent; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace; }
+    .card { border:1px solid #e5e7eb; border-radius: 16px; background:#fff; box-shadow: 0 1px 1px rgba(0,0,0,.03); }
+    .meta-pre { white-space: pre-wrap; word-break: break-word; } /* переносы строк */
+    /* Modal shell */
+    .modal-shell { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 50; }
+    .modal-open { display: flex; }
+    /* Graph modal layout */
+    #graph-modal .graph-wrap { position: relative; background:#fff; overflow: hidden; border-right: 1px solid #e5e7eb; }
+    #graph-modal .graph-canvas { position: absolute; inset: 0; }
+    #graph-modal .graph-canvas svg { width: 100%; height: 100%; display: block; }
+    /* Node card grid in modal */
+    #graph-modal .nodes-panel { width: 380px; }
+    /* Center action bar in modal */
+    #graph-modal .toolbar { position: absolute; left: 12px; top: 12px; display: flex; gap: 8px; z-index: 1; }
+    #graph-modal .toolbar .btn { background: rgba(255,255,255,.9); backdrop-filter: saturate(180%) blur(4px); }
+    /* Small badges in list tree */
+    .node-row { transition: background .15s ease; }
+    .node-row:hover { background: #f8fafc; }
+    /* Style for expanded task text in the left tree */
+    .task-label.whitespace-normal {
+        white-space: normal;
+        overflow: visible;
+        text-overflow: clip;
+    }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <div class="max-w-[1400px] mx-auto p-4">
+    <header class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-xl bg-brand"></div>
+        <h1 class="text-2xl font-semibold">ML Orchestrator Dashboard</h1>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="status-badge" class="node-pill status-pending">idle</span>
+        <label class="flex items-center gap-2 text-sm">
+          <input id="cb-auto-resume" type="checkbox" class="rounded"> Resume
+        </label>
+        <button id="btn-start" class="btn btn-primary">Start</button>
+        <button id="btn-stop" class="btn btn-danger">Stop</button>
+      </div>
+    </header>
+
+    <div class="grid grid-cols-12 gap-4">
+      <!-- Left: Tree -->
+      <aside class="col-span-4 card p-3">
+        <div class="flex items-center gap-2 mb-2">
+          <input id="search" class="w-full px-3 py-2 border rounded-lg" placeholder="Поиск узлов..." />
+        </div>
+        <div id="tree" class="max-h-[70vh] overflow-auto pr-2"></div>
+        <div class="mt-2">
+          <button id="btn-open-graph" class="btn w-full">Открыть график</button>
+        </div>
+      </aside>
+
+      <!-- Center: Details + Editors -->
+      <main class="col-span-8 space-y-4">
+        <section class="card p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-lg font-semibold">Детали узла</h2>
+            <div class="text-xs text-gray-500">Кликни по узлу слева</div>
+          </div>
+          <div id="node-details" class="space-y-3 text-sm">
+            <div class="text-gray-500">Ничего не выбрано.</div>
+          </div>
+        </section>
+
+        <section class="grid grid-cols-2 gap-4">
+          <div class="card p-4">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="font-semibold">task.txt</h3>
+              <div class="flex items-center gap-2">
+                <button id="btn-task-save" class="btn">Сохранить</button>
+                <button id="btn-task-reload" class="btn">Обновить</button>
+              </div>
+            </div>
+            <textarea id="task-editor" class="w-full h-60 mono p-3 border rounded-lg" spellcheck="false"></textarea>
+          </div>
+
+          <div class="card p-4">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="font-semibold">config.yaml</h3>
+              <div class="flex items-center gap-2">
+                <button id="btn-config-validate" class="btn">Проверить</button>
+                <button id="btn-config-save" class="btn btn-primary">Сохранить</button>
+                <button id="btn-config-reload" class="btn">Обновить</button>
+              </div>
+            </div>
+
+            <div class="text-xs text-gray-600 mb-1">Формовый редактор (раскрывающиеся секции):</div>
+            <div id="config-structured" class="space-y-2 mb-3"></div>
+            <div class="flex items-center gap-2">
+              <button class="btn" id="btn-config-build-form">Построить форму</button>
+              <button class="btn btn-primary" id="btn-config-save-form">Сохранить из формы</button>
+            </div>
+
+            <hr class="my-3">
+            <div class="text-xs text-gray-600 mb-1">Raw YAML:</div>
+            <textarea id="config-editor" class="w-full h-60 mono p-3 border rounded-lg" spellcheck="false"></textarea>
+            <pre id="config-validate-output" class="text-xs text-gray-500 mt-2"></pre>
+          </div>
+        </section>
+
+        <section class="card p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="font-semibold">Логи процесса</h3>
+            <div class="text-xs text-gray-500">realtime</div>
+          </div>
+          <pre id="logs" class="mono text-xs h-60 overflow-auto bg-black text-gray-100 p-3 rounded-lg"></pre>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Confirm Modal -->
+  <div id="modal" class="modal-shell">
+    <div class="bg-white p-6 rounded-2xl shadow-xl w-[520px]">
+      <h4 id="modal-title" class="text-lg font-semibold mb-2"></h4>
+      <p id="modal-desc" class="text-sm text-gray-600 mb-4"></p>
+      <div class="flex justify-end gap-2">
+        <button id="modal-cancel" class="btn">Отмена</button>
+        <button id="modal-ok" class="btn btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Graph Modal (fullscreen) -->
+  <div id="graph-modal" class="modal-shell">
+    <div class="w-[95vw] h-[90vh] bg-white rounded-2xl shadow-2xl overflow-hidden flex">
+      <div class="graph-wrap flex-1">
+        <div class="toolbar">
+          <button class="btn" id="btn-zoom-in">+</button>
+          <button class="btn" id="btn-zoom-out">−</button>
+          <button class="btn" id="btn-zoom-reset">Reset</button>
+          <button class="btn" id="btn-fit">Fit</button>
+          <button class="btn btn-primary" id="btn-center">Center</button>
+        </div>
+        <div id="graph-modal-canvas" class="graph-canvas"></div>
+      </div>
+      <!-- Измененная правая панель с фиксированным заголовком -->
+      <div class="nodes-panel w-[380px] flex flex-col border-l border-gray-200">
+        <div class="p-4 border-b border-gray-200">
+          <div class="flex items-center justify-between">
+            <h3 id="graph-modal-panel-title" class="font-semibold">Узлы</h3>
+            <button id="btn-graph-close" class="btn">Закрыть</button>
+          </div>
+        </div>
+        <div class="flex-1 overflow-y-auto p-4">
+          <div id="graph-modal-nodes" class="space-y-2"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script>
+/* ----------------- helpers ----------------- */
+const $ = sel => document.querySelector(sel);
+const _api_ = {
+  get: (u) => fetch(u).then(r => r.ok ? r.text() : r.text().then(t => { throw new Error(t) })),
+  getJSON: (u) => fetch(u).then(r => r.json()),
+  put: (u, body, type="text/plain") => fetch(u, {method:"PUT", body, headers:{"Content-Type":type}})
+      .then(r => r.ok ? r.json() : r.text().then(t=>{throw new Error(t)})),
+  postJSON: (u, body={}) => fetch(u, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})
+      .then(r => r.ok ? r.json() : r.text().then(t=>{throw new Error(t)})),
+};
+/* ----------------- app state ----------------- */
+let _TREE_ = {nodes:{}, roots:[]};
+let _SELECTED_ = null;
+let _WS_ = null;
+let _USE_SSE_ = false;
+let _CFG_OBJ_ = {};
+let _lastFocusId_ = null;
+
+/* ----------------- UI helpers ----------------- */
+function pill(status){
+  const cls = status==='done' ? 'status-done' : status==='running' ? 'status-running' : status==='failed' ? 'status-failed' : 'status-pending';
+  return `<span class="node-pill ${cls}">${status||'pending'}</span>`;
+}
+function kindIcon(kind){
+  const map = {main:'🟣', improve:'🟠', 'improve_group':'🟡', 'improve_leaf':'🟢', subtask:'🔵',
+               'tasks_tree:root':'⚓', 'tasks_tree:subtask':'🔹', 'meta_planner':'🧠'};
+  return map[kind] || '⚪';
+}
+
+/* ----------- left list tree renderer ----------- */
+function renderTree(filter=""){
+  const t = $("#tree");
+  const q = (filter||"").trim().toLowerCase();
+  const nodes = _TREE_.nodes||{};
+  let roots = ( _TREE_.roots||[]).slice();
+  if ((!roots || roots.length===0) && nodes && Object.keys(nodes).length>0){
+    roots = Object.keys(nodes).filter(id=>{
+      const n = nodes[id]; const pid = n && n.parent_node_id;
+      return !pid || !(pid in nodes);
+    });
+  }
+  function renderNode(id, depth=0){
+    const n = nodes[id]; if(!n) return "";
+    const label = (n.task||"").slice(0,160);
+    const hidden = q && !(id.toLowerCase().includes(q) || (n.task||"").toLowerCase().includes(q) || (n.kind||"").toLowerCase().includes(q));
+    const pad = `style="padding-left:${depth*12}px"`;
+    let html = `<div class="node-row flex items-center gap-2 py-1 cursor-pointer rounded px-2 ${hidden?'hidden':''}" data-node="${id}" ${pad}>
+        <span>${kindIcon(n.kind)}</span>
+        <span class="mono text-[10px] text-gray-400">${id}</span>
+        <span class="task-label text-sm min-w-0 truncate" title="${(n.task||'').replaceAll('"','&quot;')}">${label}</span>
+        <span class="ml-auto">${pill(n.status)}</span>
+      </div>`;
+
+    // Sort children for stable visualization:
+    //  - keep main/improve separated so improve stays on the right
+    //  - order by readiness time to avoid visual "mixing"
+    let ch = (n.children||[]).slice();
+    function _ready_ms(id){
+      const nn = nodes[id] || {};
+      const t = nn.finished_at || nn.started_at || nn.created_at || null;
+      const ms = t ? new Date(t).getTime() : Number.POSITIVE_INFINITY;
+      return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+    }
+    ch.sort((a,b) => {
+      let ka = (nodes[a]&&nodes[a].kind)||'';
+      let kb = (nodes[b]&&nodes[b].kind)||'';
+      let isImpA = ka.includes('improve');
+      let isImpB = kb.includes('improve');
+      if (isImpA && !isImpB) return 1;   // improve later => right
+      if (!isImpA && isImpB) return -1;
+      const ta = _ready_ms(a);
+      const tb = _ready_ms(b);
+      if (ta !== tb) return ta - tb;     // earlier ready => left
+      return String(a).localeCompare(String(b));
+    });
+
+    for (const cid of ch){ html += renderNode(cid, depth+1); }
+    return html;
+    }
+    let html = "";
+    for (const r of roots){ html += renderNode(r, 0); }
+    t.innerHTML = html || '<div class="text-sm text-gray-500 px-2">Дерево пусто.</div>';
+
+    // -- RENDER METRICS HISTORY --
+    function renderMetricsHistory(nodes) {
+        const metricsContainer = document.getElementById("metrics-history") || (function(){
+            const div = document.createElement("div");
+            div.id = "metrics-history";
+            div.className = "mt-4 card p-3";
+            const aside = document.querySelector("aside.col-span-4");
+            aside.appendChild(div);
+            return div;
+        })();
+        
+        let history = [];
+        for (const id in nodes) {
+            const n = nodes[id];
+            if (n && n.meta && n.meta.metrics && n.meta.metrics.primary) {
+                history.push({
+                    id: id,
+                    time: n.finished_at || n.started_at || n.created_at,
+                    score: parseFloat(n.meta.metrics.primary),
+                    iter: n.meta.iter_idx !== undefined ? n.meta.iter_idx : 'Main'
+                });
+            }
+        }
+        
+        if (history.length === 0) {
+            metricsContainer.innerHTML = '<h3 class="font-semibold mb-2">Metrics History</h3><div class="text-xs text-gray-500">Нет метрик</div>';
+            return;
+        }
+
+        // Sort by time
+        history.sort((a,b) => new Date(a.time) - new Date(b.time));
+        
+        const maxScore = Math.max(...history.map(h => h.score));
+        
+        let html = '<h3 class="font-semibold mb-2">Metrics History</h3>';
+        html += `<div class="text-sm mb-2 text-brand font-bold">Max Score: ${maxScore.toFixed(4)}</div>`;
+        
+        html += '<div class="space-y-1 text-xs">';
+        history.forEach((h, i) => {
+            const isMax = h.score === maxScore;
+            html += `<div class="flex justify-between items-center ${isMax ? 'bg-green-50 font-bold' : ''} p-1 rounded cursor-pointer hover:bg-gray-100" onclick="selectNode('${h.id}')">
+                <span class="text-gray-500 w-12 truncate">Iter ${h.iter}</span>
+                <span class="flex-1 overflow-hidden truncate px-2" title="${h.id}">${h.id.substring(0,8)}</span>
+                <span class="${isMax ? 'text-green-600' : ''}">${h.score.toFixed(4)}</span>
+            </div>`;
+        });
+        html += '</div>';
+        
+        metricsContainer.innerHTML = html;
+    }
+
+    t.querySelectorAll("[data-node]").forEach(el=>{    el.onclick = (e)=> {
+        const textSpan = el.querySelector('.task-label');
+        // Проверяем, был ли клик по тексту задачи
+        if (textSpan && textSpan.contains(e.target)) {
+            e.stopPropagation(); // Останавливаем всплытие, чтобы не выбрать узел
+            // Переключаем классы для сворачивания/разворачивания текста
+            textSpan.classList.toggle('truncate');
+            textSpan.classList.toggle('min-w-0');
+            textSpan.classList.toggle('whitespace-normal');
+        } else {
+            // Если клик был не по тексту, выбираем узел
+            selectNode(el.getAttribute("data-node"));
+        }
+    };
+  });
+}
+
+/* ----------- node details panel ----------- */
+async function selectNode(id){
+  try{
+    const data = await _api_.getJSON(`/api/node/${encodeURIComponent(id)}`);
+    _SELECTED_ = data.node;
+    _lastFocusId_ = id;
+    const n = data.node;
+    const det = $("#node-details");
+
+    // Преобразуем метаданные в строку, а затем заменяем экранированные переносы строк на реальные
+    let meta = JSON.stringify(n.meta||{}, null, 2);
+    // Сначала экранируем HTML-теги, которые могут быть в строке
+    meta = meta.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Теперь заменяем '\\n' на реальный перенос строки, который <pre> обработает
+    meta = meta.replace(/\\n/g, '\n');
+
+    const times = [
+      n.created_at?`<div><b>created</b>: ${n.created_at}</div>`:"",
+      n.started_at?`<div><b>started</b>: ${n.started_at}</div>`:"",
+      n.finished_at?`<div><b>finished</b>: ${n.finished_at}</div>`:"",
+    ].join("");
+    det.innerHTML = `
+      <div class="flex items-start gap-3">
+        <div class="text-2xl">${kindIcon(n.kind)}</div>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <div class="mono text-[11px] text-gray-500 break-all">${n.node_id}</div>
+            ${pill(n.status)}
+          </div>
+          <div class="text-sm mt-1"><b>kind</b>: ${n.kind||'-'}</div>
+          <div class="text-sm mt-1"><b>parent</b>: ${n.parent_node_id||'-'}</div>
+          <div class="text-sm mt-1"><b>children</b>: ${(n.children||[]).length}</div>
+          <div class="text-sm mt-1 break-words"><b>task</b>: ${(n.task||'').replaceAll('<','&lt;')}</div>
+          <div class="grid grid-cols-3 gap-2 mt-3 text-xs">${times}</div>
+        </div>
+      </div>
+      <div class="mt-4">
+        <h4 class="font-semibold mb-1">Meta</h4>
+        <pre class="mono text-xs bg-gray-100 p-2 rounded-lg meta-pre">${meta}</pre>
+      </div>`;
+    // links
+    const links = [];
+    const m = n.meta||{};
+    const link = (label, path)=> path ? `<a class="text-brand underline" href="/api/file?path=${encodeURIComponent(path)}" target="_blank">${label}</a>` : "";
+    if (m.metrics_path) links.push(link("metrics.json", m.metrics_path));
+    if (m.stdout_file)  links.push(link("stdout", m.stdout_file));
+    if (m.stderr_file)  links.push(link("stderr", m.stderr_file));
+    if (m.script_file)  links.push(link("script", m.script_file));
+    if (m.path)         links.push(link("file", m.path));
+    if (links.length){
+      det.innerHTML += `<div class="mt-3"><h4 class="font-semibold mb-1">Файлы</h4><div class="flex gap-3 text-sm flex-wrap">${links.join("")}</div></div>`;
+    }
+  }catch(e){
+    $("#node-details").innerHTML = `<div class="text-red-600 text-sm">Ошибка загрузки узла: ${e}</div>`;
+  }
+}
+
+function setStatusBadge(running){
+  const b = $("#status-badge");
+  if(running){
+    b.className = "node-pill status-running";
+    b.textContent = "running";
+  } else {
+    b.className = "node-pill status-pending";
+    b.textContent = "idle";
+  }
+}
+
+/* ---------------- editors ---------------- */
+async function loadEditors(){
+  $("#task-editor").value = await _api_.get("/api/task").catch(_=>"");
+  $("#config-editor").value = await _api_.get("/api/config").catch(_=>"");
+}
+
+/* --------------- confirm modal --------------- */
+function confirmModal(title, desc){
+  return new Promise(res=>{
+    $("#modal-title").textContent = title;
+    $("#modal-desc").textContent = desc;
+    const modal = $("#modal");
+    modal.classList.add("modal-open");
+    const cleanup = ()=>{
+      $("#modal-ok").onclick = null;
+      $("#modal-cancel").onclick = null;
+      modal.classList.remove("modal-open");
+    };
+    $("#modal-ok").onclick = ()=>{ cleanup(); res(true); };
+    $("#modal-cancel").onclick = ()=>{ cleanup(); res(false); };
+  });
+}
+
+/* --------------- run controls --------------- */
+async function startRun(){
+  const resume = $("#cb-auto-resume").checked;
+  const ok = await confirmModal("Запуск пайплайна", `Точно запустить? resume=${resume}`);
+  if(!ok) return;
+  try{
+    await _api_.postJSON(`/api/run?resume=${resume}`);
+  }catch(e){ alert("Ошибка запуска: " + e); }
+}
+async function stopRun(){
+  const ok = await confirmModal("Остановить процесс", "Будет отправлен мягкий сигнал остановки. Продолжить?");
+  if(!ok) return;
+  try{ await _api_.postJSON(`/api/stop`); }
+  catch(e){ alert("Ошибка остановки: " + e); }
+}
+async function saveTask(){ await _api_.put("/api/task", $("#task-editor").value); }
+async function reloadTask(){ $("#task-editor").value = await _api_.get("/api/task"); }
+async function validateConfig(){
+  const text = $("#config-editor").value;
+  try { await _api_.put("/api/config?validate=true", text); $("#config-validate-output").textContent = "OK"; }
+  catch(e){ $("#config-validate-output").textContent = "Ошибка: " + e; }
+}
+async function saveConfig(){
+  const text = $("#config-editor").value;
+  const ok = await confirmModal("Сохранить config.yaml", "Изменения вступят в силу со следующего запуска. Сохранить?");
+  if(!ok) return;
+  try { await _api_.put("/api/config?validate=true", text); $("#config-validate-output").textContent = "OK"; }
+  catch(e){ $("#config-validate-output").textContent = "Ошибка: " + e; }
+}
+async function reloadConfig(){ $("#config-editor").value = await _api_.get("/api/config"); }
+
+/* ------- Structured YAML form with + / − for arrays ------- */
+function inferRange(key, val){
+  const norm = String(key).toLowerCase();
+  if (norm.includes("timeout")) return [0, 3_600_000];
+  if (norm.includes("temperature")) return [0, 2];
+  if (norm.includes("iters") || norm.includes("epoch") || norm.includes("kfold") || norm.includes("k_fold")) return [0, 100];
+  if (typeof val === "number") {
+    if (Number.isInteger(val)) return [0, Math.max(10, val*3)];
+    return [0, Math.max(1, Math.ceil(val*2))];
+  }
+  return null;
+}
+function renderField(path, key, val){
+  const id = ("f-" + path.concat([key]).join("__")).replace(/[^\w\-]/g, "_");
+  const label = `<label class="text-sm font-medium">${key}</label>`;
+  if (typeof val === "boolean"){
+    return `<div class="flex items-center justify-between py-1">
+      ${label}
+      <input id="${id}" type="checkbox" ${val?"checked":""} class="w-5 h-5 rounded">
+    </div>`;
+  }
+  if (typeof val === "number"){
+    const range = inferRange(key, val);
+    const slider = range ? `<input id="${id}-range" type="range" min="${range[0]}" max="${range[1]}" step="${Number.isInteger(val)?1:0.01}" value="${val}" class="w-full">` : "";
+    return `<div class="space-y-1 py-1">
+      ${label}
+      <div class="flex items-center gap-2">
+        ${slider}
+        <input id="${id}" type="number" step="${Number.isInteger(val)?1:0.01}" value="${val}" class="w-32 px-2 py-1 border rounded">
+      </div>
+    </div>`;
+  }
+  if (typeof val === "string"){
+    const multiline = val.length > 80 || val.includes("\n");
+    return `<div class="space-y-1 py-1">
+      ${label}
+      ${multiline
+        ? `<textarea id="${id}" class="w-full h-24 mono p-2 border rounded">${val.replace(/</g,"&lt;")}</textarea>`
+        : `<input id="${id}" type="text" value="${val.replace(/"/g,"&quot;").replace(/</g,"&lt;")}" class="w-full px-2 py-1 border rounded">`}
+    </div>`;
+  }
+  if ( Array.isArray(val)){
+    const items = val.map((v, idx)=> `<div class="pl-2 border-l" data-array-item="${id}__${idx}">
+        ${renderField(path.concat([key]), String(idx), v)}
+      </div>`).join("");
+    return `<details class="rounded border p-2">
+      <summary class="cursor-pointer select-none text-sm font-semibold">[ ] ${key}  <span class="text-xs text-gray-500">array, ${val.length} items</span></summary>
+      <div class="space-y-2 mt-2">${items||'<div class="text-xs text-gray-500">empty</div>'}</div>
+      <div class="flex gap-2 mt-2">
+        <button class="btn" onclick="return addArrayItem('${path.concat([key]).join('.')}', '')">+ добавить</button>
+        <button class="btn" onclick="return removeArrayItem('${path.concat([key]).join('.')}')">− удалить последний</button>
+      </div>
+    </details>`;
+  }
+  if (typeof val === "object" && val){
+    const inner = Object.entries(val).map(([k,v])=> renderField(path.concat([key]), k, v)).join("");
+    return `<details class="rounded border p-2">
+      <summary class="cursor-pointer select-none text-sm font-semibold">{ } ${key}</summary>
+      <div class="space-y-2 mt-2">${inner||'<div class="text-xs text-gray-500">empty</div>'}</div>
+    </details>`;
+  }
+  return `<div>${label}<div class="text-xs text-gray-500">null</div></div>`;
+}
+function pathGet(obj, pathArr){
+  return pathArr.reduce((o,k)=>(o||{})[k], obj);
+}
+function pathSet(obj, pathArr, value){
+  let cur = obj;
+  for (let i=0;i<pathArr.length-1;i++){
+    const k = pathArr[i];
+    if (!(k in cur) || typeof cur[k] !== "object" || cur[k]===null){
+      cur[k] = Number.isInteger(+pathArr[i+1]) ? [] : {};
+    }
+    cur = cur[k];
+  }
+  cur[pathArr[pathArr.length-1]] = value;
+}
+function objectSet(obj, path, value){ pathSet(obj, path, value); }
+window.addArrayItem = function dottedAdd(pathDot, defaultVal){
+  const pathArr = pathDot.split(".");
+  const arr = pathGet( _CFG_OBJ_, pathArr) || [];
+  arr.push(defaultVal);
+  pathSet( _CFG_OBJ_, pathArr, arr);
+  loadConfigStructured(); // пересобрать форму
+  return false;
+}
+window.removeArrayItem = function dottedRemove(pathDot){
+  const pathArr = pathDot.split(".");
+  const arr = pathGet( _CFG_OBJ_, pathArr) || [];
+  if (arr.length>0) arr.pop();
+  pathSet( _CFG_OBJ_, pathArr, arr);
+  loadConfigStructured();
+  return false;
+}
+function bindField(path, key, val){
+  const baseId = ("f-" + path.concat([key]).join("__")).replace(/[^\w\-]/g, "_");
+  const applyValue = (v)=> objectSet( _CFG_OBJ_, path.concat([key]), v);
+  if (typeof val === "boolean"){
+    const el = document.getElementById(baseId);
+    el && (el.onchange = ()=> applyValue(!!el.checked));
+    return;
+  }
+  if (typeof val === "number"){
+    const num = document.getElementById(baseId);
+    const rng = document.getElementById(baseId+"-range");
+    if (num){
+      num.oninput = ()=>{
+        const v = Number(num.value);
+        applyValue(v);
+        if (rng){ rng.value = v; }
+      };
+    }
+    if (rng){
+      rng.oninput = ()=>{
+        const v = Number(rng.value);
+        applyValue(v);
+        if (num){ num.value = v; }
+      };
+    }
+    return;
+  }
+  if (typeof val === "string"){
+    const el = document.getElementById(baseId);
+    el && (el.oninput = ()=> applyValue(el.value));
+    return;
+  }
+  if ( Array.isArray(val)){
+    val.forEach((v, idx)=> bindField(path.concat([key]), String(idx), v));
+    return;
+  }
+  if (typeof val === "object" && val){
+    Object.entries(val).forEach(([k,v])=> bindField(path.concat([key]), k, v));
+  }
+}
+async function loadConfigStructured(){
+  try{
+    const raw = await _api_.get("/api/config");
+    _CFG_OBJ_ = jsyaml.load(raw) || {};
+    const container = document.createElement("div");
+    container.className = "space-y-2";
+    container.innerHTML = Object.entries( _CFG_OBJ_).map(([k,v])=> renderField([], k, v)).join("");
+    const panel = $("#config-structured");
+    panel.innerHTML = "";
+    panel.appendChild(container);
+    Object.entries( _CFG_OBJ_).forEach(([k,v])=> bindField([], k, v));
+  }catch(e){ console.error(e); }
+}
+async function saveConfigStructured(){
+  try{
+    const yamlText = jsyaml.dump( _CFG_OBJ_, {lineWidth: 120});
+    await _api_.put("/api/config?validate=true", yamlText, "text/plain");
+    $("#config-validate-output").textContent = "OK";
+  }catch(e){
+    $("#config-validate-output").textContent = "Ошибка: " + e;
+  }
+}
+
+/* ----------------- live tree/status/logs ----------------- */
+function connectSSE(){
+  const es = new EventSource("/events");
+  es.addEventListener("status", (e)=>{
+    try{ const data = JSON.parse(e.data); setStatusBadge(!!data.running); }catch(_){}
+  });
+  es.addEventListener("tree", (e)=>{
+    try{
+      const data = JSON.parse(e.data);
+      _TREE_ = data || {nodes:{}, roots:[]};
+      renderTree($("#search").value);
+      if ( _SELECTED_){ selectNode( _SELECTED_.node_id).catch(()=>{}); }
+    }catch(_){}
+  });
+  es.addEventListener("task", (e)=>{
+    try{
+      const data = JSON.parse(e.data);
+      const te = $("#task-editor");
+      if ( document.activeElement !== te) { te.value = data.text || ""; }
+    }catch(_){}
+  });
+}
+function connectWS(){
+  try{
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    _WS_ = new WebSocket(`${proto}://${ location.host}/ws`);
+    _WS_.onclose = ()=>{ if (! _USE_SSE_){ _USE_SSE_ = true; connectSSE(); } setTimeout(connectWS, 1500); };
+    _WS_.onerror = ()=>{ if (! _USE_SSE_){ _USE_SSE_ = true; connectSSE(); } };
+    _WS_.onmessage = (ev)=>{
+      try{
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "status"){
+          setStatusBadge(!!msg.data.running);
+        } else if (msg.type === "tree"){
+          _TREE_ = msg.data || {nodes:{}, roots:[]};
+          renderTree($("#search").value);
+          if ( _SELECTED_){ selectNode( _SELECTED_.node_id).catch(()=>{}); }
+        } else if (msg.type === "log"){
+          const pre = $("#logs");
+          pre.textContent += (msg.stream === "stderr" ? "[ERR] " : "") + msg.line;
+          pre.scrollTop = pre.scrollHeight;
+        } else if (msg.type === "task"){
+          const te = $("#task-editor");
+          if ( document.activeElement !== te) { te.value = msg.text || ""; }
+        }
+      }catch(_){}
+    };
+  }catch(e){
+    if (! _USE_SSE_){ _USE_SSE_ = true; connectSSE(); }
+  }
+}
+
+/* ----------------- graph modal with d3 ----------------- */
+let _modalD3_ = {
+  svg: null, g: null, zoom: null, layout: null, nodesCache: null, linkSel: null, nodeSel: null,
+  W: 1000, H: 800
+};
+
+function openGraphModal(focusId=null){
+  const shell = $("#graph-modal");
+  shell.classList.add("modal-open");
+  setTimeout(()=> renderModalTree( _TREE_, focusId|| _lastFocusId_), 0);
+}
+function closeGraphModal(){
+  $("#graph-modal").classList.remove("modal-open");
+  // Reset panel title when closing modal
+  $("#graph-modal-panel-title").textContent = "Узлы";
+}
+
+/* Build hierarchical data from flat TREE */
+function buildHierarchy(tree){
+  const nodes = tree.nodes || {};
+  let roots = (tree.roots||[]).slice();
+  if ((!roots || roots.length===0) && nodes && Object.keys(nodes).length>0){
+    roots = Object.keys(nodes).filter(id=>{
+      const n = nodes[id]; const pid = n && n.parent_node_id;
+      return !pid || !(pid in nodes);
+    });
+  }
+  function inflate(id){
+    const n = nodes[id]; if (!n) return null;
+    // Sort children to keep improve branch on the right and stable by readiness time.
+    const childIds = (n.children || []).slice();
+    function _ready_ms(nn){
+      const t = nn?.finished_at || nn?.started_at || nn?.created_at || null;
+      const ms = t ? new Date(t).getTime() : Number.POSITIVE_INFINITY;
+      return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+    }
+    childIds.sort((aId, bId) => {
+      const na = nodes[aId] || {};
+      const nb = nodes[bId] || {};
+      const ka = (na.kind || '') || '';
+      const kb = (nb.kind || '') || '';
+      const isImpA = ka.includes('improve');
+      const isImpB = kb.includes('improve');
+      if (isImpA && !isImpB) return 1;
+      if (!isImpA && isImpB) return -1;
+      const ta = _ready_ms(na);
+      const tb = _ready_ms(nb);
+      if (ta !== tb) return ta - tb;
+      return String(aId).localeCompare(String(bId));
+    });
+    return {
+      ...n,
+      name: n.task || n.kind || id,
+      children: childIds.map(inflate).filter(Boolean)
+    };
+  }
+  if (roots.length === 1) {
+    const r = inflate(roots[0]);
+    // If there is no explicit Meta-Planner node in the backend tree,
+    // create a virtual wrapper so the graph shows:
+    // Root -> Meta-Planner -> (Level 0 nodes) -> (Level 1 nodes) ...
+    if (r && Array.isArray(r.children) && r.children.length > 0) {
+      return {
+        ...r,
+        children: [
+          {
+            name: "Meta-Planner",
+            kind: "meta_planner",
+            children: r.children,
+          },
+        ],
+      };
+    }
+    return r;
+  }
+  return { name: "ROOT", kind: "tasks_tree:root", node_id: "ROOT", children: roots.map(inflate).filter(Boolean) };
+}
+
+function renderModalTree(tree, focusId){
+  const wrap = $("#graph-modal-canvas");
+  wrap.innerHTML = "";
+  const rect = wrap.getBoundingClientRect();
+  const W = Math.max(400, rect.width|0);
+  const H = Math.max(300, rect.height|0);
+  _modalD3_.W = W; _modalD3_.H = H;
+
+  const svg = d3.select(wrap).append("svg")
+    .attr("viewBox", `0 0 ${W} ${H}`)
+    .attr("preserveAspectRatio", "xMidYMid meet")
+    .style("width","100%").style("height","100%");
+  const g = svg.append("g");
+
+  const zoom = d3.zoom()
+    .scaleExtent([0.2, 3])
+    .on("zoom", (ev) => { g.attr("transform", ev.transform); });
+  svg.call(zoom).on("dblclick.zoom", null);
+
+  _modalD3_.svg = svg; _modalD3_.g = g; _modalD3_.zoom = zoom;
+
+  const rootData = buildHierarchy(tree);
+  const root = d3.hierarchy(rootData, d => d.children);
+
+  // --- NEW: Define node widths and calculate heights ---
+  const defaultNodeWidth = 180;
+  const rootNodeWidth = 400; // Wider root node
+  let maxHeight = 0;
+
+  root.descendants().forEach(d => {
+    const isRoot = d.depth === 0;
+    const nodeWidth = isRoot ? rootNodeWidth : defaultNodeWidth;
+    let text = d.data.task || d.data.name || d.data.node_id || "";
+
+    // Truncate very long text, especially for the root node, to keep graph usable
+    if (isRoot && text.length > 500) {
+        text = text.slice(0, 500) + '...';
+    }
+
+    // Store calculated properties on the node data for later use
+    d.data._nodeWidth = nodeWidth;
+    d.data._renderText = text;
+
+    // Use a temporary element to measure text height with word wrapping
+    const tempDiv = d3.select("body").append("div")
+        .style("position", "absolute").style("visibility", "hidden")
+        .style("width", `${nodeWidth - 20}px`) // width minus horizontal padding
+        .style("font-size", "11px")
+        .style("font-family", `ui-sans-serif, system-ui, sans-serif`)
+        .style("word-wrap", "break-word")
+        .html(text.replace(/</g, '&lt;'));
+
+    const textHeight = tempDiv.node().getBoundingClientRect().height;
+    tempDiv.remove();
+
+    // Calculate final node height, with a minimum value
+    d.data._nodeHeight = Math.max(isRoot ? 60 : 40, textHeight + 24); // +24 for vertical padding
+    if (d.data._nodeHeight > maxHeight) {
+        maxHeight = d.data._nodeHeight;
+    }
+  });
+
+  // The vertical gap between levels is now based on the tallest node
+  const levelGap = maxHeight + 60;
+  const nodeGapX = defaultNodeWidth + 40; // Horizontal gap between nodes
+
+  const treeLayout = d3.tree().nodeSize([nodeGapX, levelGap]);
+  treeLayout(root);
+  _modalD3_.layout = root;
+
+  // --- Calculate overall graph bounds for fitting ---
+  const xs = root.descendants().map(d=>d.x);
+  const ys = root.descendants().map(d=>d.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  // Add the widest node's width to the bounds calculation
+  const widthNeeded = (maxX - minX) + rootNodeWidth + 40;
+  const heightNeeded = (maxY - minY) + maxHeight + 40;
+
+  // --- Draw Links ---
+  g.append("g")
+    .attr("fill","none")
+    .attr("stroke","#CBD5E1")
+    .attr("stroke-width",1.5)
+    .selectAll("path")
+    .data(root.links())
+    .join("path")
+    .attr("d", d => {
+        // Center point for layout
+        const layoutCenterX = (widthNeeded - rootNodeWidth) / 2;
+
+        const sourceX = d.source.x - minX + layoutCenterX;
+        const targetX = d.target.x - minX + layoutCenterX;
+
+        // Adjust link endpoints to connect to the bottom of the source and top of the target
+        const sourceY = d.source.y - minY + (d.source.data._nodeHeight / 2) + 20;
+        const targetY = d.target.y - minY - (d.target.data._nodeHeight / 2) + 20;
+
+        return `M${sourceX},${sourceY}`
+             + `C${sourceX},${(sourceY + targetY) / 2}`
+             + ` ${targetX},${(sourceY + targetY) / 2}`
+             + ` ${targetX},${targetY}`;
+    });
+
+  // --- Draw Nodes ---
+  const nodesSel = g.append("g").selectAll("g.node")
+    .data(root.descendants())
+    .join("g")
+    .attr("class","node cursor-pointer")
+    .attr("transform", d => {
+        const layoutCenterX = (widthNeeded - rootNodeWidth) / 2;
+        const x = d.x - minX + layoutCenterX;
+        const y = d.y - minY + 20;
+        return `translate(${x}, ${y})`;
+    });
+
+  _modalD3_.nodeSel = nodesSel;
+
+  // Node rectangle
+  nodesSel.append("rect")
+    .attr("x", d => -d.data._nodeWidth / 2)
+    .attr("y", d => -d.data._nodeHeight / 2)
+    .attr("rx", 10).attr("ry", 10)
+    .attr("width", d => d.data._nodeWidth)
+    .attr("height", d => d.data._nodeHeight)
+    .attr("fill", d => {
+      const k = d.data.kind;
+      if (k === "main") return "#ede9fe";
+      if (k === "improve") return "#fff7ed";
+      if (k === "improve_group") return "#fefce8";
+      if (k === "improve_leaf") return "#ecfeff";
+      if (k === "meta_planner") return "#eef2ff";
+      return "#f1f5f9";
+    })
+    .attr("stroke", "#94a3b8");
+
+  // Node text using foreignObject for wrapping
+  nodesSel.append("foreignObject")
+    .attr("x", d => -d.data._nodeWidth / 2 + 10)
+    .attr("y", d => -d.data._nodeHeight / 2 + 12)
+    .attr("width", d => d.data._nodeWidth - 20)
+    .attr("height", d => d.data._nodeHeight - 24)
+    .append("xhtml:div")
+    .style("font-size", "11px").style("color", "#1f2937")
+    .style("height", "100%").style("display", "flex")
+    .style("align-items", "center").style("justify-content", "center")
+    .style("text-align", "center").style("line-height", "1.3")
+    .style("word-break", "break-word")
+    .html(d => d.data._renderText.replace(/</g, '&lt;'));
+
+  // Status pill
+  nodesSel.append("text")
+    .attr("text-anchor","end")
+    .attr("x", d => d.data._nodeWidth / 2 - 8)
+    .attr("y", d => -d.data._nodeHeight / 2 + 12)
+    .attr("font-size","9")
+    .attr("fill", d => {
+      const st = d.data.status || "pending";
+      return st==="done" ? "#15803d" : st==="running" ? "#1d4ed8" : st==="failed" ? "#991b1b" : "#374151";
+    })
+    .text(d => d.data.status||"pending");
+
+  // --- Event Handlers and Final Setup ---
+  nodesSel.on("click", (ev, d) => {
+    if (d.data.node_id){ _lastFocusId_ = d.data.node_id; }
+    // selectNodeFromGraph(d.data.node_id); // This is now handled by the right panel
+    const detailsEl = document.getElementById(`list-node-${d.data.node_id}`);
+    if (detailsEl) {
+        detailsEl.open = true;
+        detailsEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  });
+
+  // Sort right-panel list by readiness time to reduce "mixing".
+  const _itemsForPanel_ = root.descendants().map(d => d.data);
+  function _ready_ms_any_(nn){
+    const t = nn?.finished_at || nn?.started_at || nn?.created_at || null;
+    const ms = t ? new Date(t).getTime() : Number.POSITIVE_INFINITY;
+    return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+  }
+  _itemsForPanel_.sort((a,b) => _ready_ms_any_(a) - _ready_ms_any_(b));
+  renderModalNodesList(_itemsForPanel_);
+  fitGraphToView(widthNeeded, heightNeeded, W, H);
+  if (focusId){ centerOnNodeById(focusId, true); }
+
+  // Toolbar buttons
+  $("#btn-zoom-in").onclick = ()=> smoothZoom(1.2);
+  $("#btn-zoom-out").onclick = ()=> smoothZoom(1/1.2);
+  $("#btn-zoom-reset").onclick = ()=> svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity);
+  $("#btn-fit").onclick = ()=> fitGraphToView(widthNeeded, heightNeeded, W, H, true);
+  $("#btn-center").onclick = ()=> { if ( _lastFocusId_) centerOnNodeById( _lastFocusId_, true); };
+
+  // Resize observer
+  const ro = new ResizeObserver(()=> {
+    const r = wrap.getBoundingClientRect();
+    _modalD3_.W = Math.max(400, r.width|0);
+    _modalD3_.H = Math.max(300, r.height|0);
+    fitGraphToView(widthNeeded, heightNeeded, _modalD3_.W, _modalD3_.H);
+    if ( _lastFocusId_) centerOnNodeById( _lastFocusId_, false);
+  });
+  ro.observe(wrap);
+
+  // --- Helper functions for zoom/pan ---
+  function smoothZoom(kFactor){
+    const t = d3.zoomTransform(svg.node());
+    const cx = W/2, cy = H/2;
+    const newK = Math.max(0.2, Math.min(3, t.k * kFactor));
+    const scale = newK / t.k;
+    const newX = (t.x - cx) * scale + cx;
+    const newY = (t.y - cy) * scale + cy;
+    svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity.translate(newX, newY).scale(newK));
+  }
+
+  function fitGraphToView(wNeeded, hNeeded, vw, vh, animate=false){
+    const scale = Math.min(0.95, vw / wNeeded, vh / hNeeded);
+    const tx = (vw - wNeeded * scale) / 2;
+    const ty = (vh - hNeeded * scale) / 2 + 20; // Add some top margin
+    const transform = d3.zoomIdentity.translate(tx, ty).scale(scale);
+    if (animate) svg.transition().duration(300).call(zoom.transform, transform);
+    else svg.call(zoom.transform, transform);
+  }
+
+  function centerOnNodeById(nodeId, animate=true){
+    if (!nodeId) return;
+    const node = root.descendants().find(d => d.data.node_id === nodeId);
+    if (!node) return;
+
+    const layoutCenterX = (widthNeeded - rootNodeWidth) / 2;
+    const nx = node.x - minX + layoutCenterX;
+    const ny = node.y - minY + 20;
+
+    const t = d3.zoomTransform(svg.node());
+    const k = t.k;
+    const targetX = _modalD3_.W/2 - nx * k;
+    const targetY = _modalD3_.H/2 - ny * k;
+    const transform = d3.zoomIdentity.translate(targetX, targetY).scale(k);
+    if (animate) svg.transition().duration(350).call(zoom.transform, transform);
+    else svg.call(zoom.transform, transform);
+  }
+
+  window.centerOnNodeById = centerOnNodeById;
+}
+
+/* Right-side list inside graph modal */
+function renderModalNodesList(items){
+  const panel = $("#graph-modal-nodes");
+  panel.innerHTML = items.map(d=>{
+    if (!d.node_id) return ""; // Пропускаем корневой узел без ID
+    const taskFull = (d.task || d.name || d.node_id || "");
+    const short = taskFull.length > 100 ? (taskFull.slice(0,100) + "…") : taskFull;
+    const nodeIdSafe = (d.node_id||'').replaceAll("'","\\'");
+
+    return `
+    <div class="border rounded-xl bg-white shadow-sm">
+      <details id="list-node-${d.node_id}">
+        <summary class="p-3 cursor-pointer list-none">
+          <div class="flex items-start gap-3">
+            <div class="text-xl pt-1">${kindIcon(d.kind)}</div>
+            <div class="min-w-0">
+              <div class="flex items-center gap-2">
+                <div class="mono text-[10px] text-gray-500 break-all">${d.node_id}</div>
+                ${pill(d.status||"pending")}
+              </div>
+              <div class="text-sm mt-1 break-words font-medium">${short.replaceAll('<','&lt;')}</div>
+            </div>
+          </div>
+        </summary>
+        <div class="px-3 pb-3 border-t border-gray-200">
+          <h5 class="font-semibold text-xs text-gray-500 uppercase mt-2 mb-1">Full Task</h5>
+          <p class="text-sm break-words mb-3">${taskFull.replaceAll('<','&lt;')}</p>
+
+          <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs text-gray-600 mb-3">
+              <div><strong>Kind:</strong> ${d.kind}</div>
+              <div><strong>Status:</strong> ${d.status}</div>
+              <div><strong>Parent:</strong> ${d.parent_node_id || '-'}</div>
+              <div><strong>Children:</strong> ${(d.children || []).length}</div>
+          </div>
+
+          <div class="flex gap-2">
+            <button class="btn text-sm py-1 px-3" onclick="centerOnNodeById('${nodeIdSafe}')">Найти</button>
+            <button class="btn btn-primary text-sm py-1 px-3" onclick="showNodeDetailsInModal('${nodeIdSafe}')">Детали</button>
+          </div>
+        </div>
+      </details>
+    </div>`;
+  }).join("");
+}
+
+// NEW: Show detailed node info inside the modal's right panel
+async function showNodeDetailsInModal(id) {
+  try {
+    const data = await _api_.getJSON(`/api/node/${encodeURIComponent(id)}`);
+    const n = data.node;
+    const panel = $("#graph-modal-nodes");
+    const title = $("#graph-modal-panel-title");
+
+    title.innerHTML = `<span class="text-sm font-normal text-gray-600">Детали: </span> ${id}`;
+
+    let meta = JSON.stringify(n.meta || {}, null, 2);
+    meta = meta.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    meta = meta.replace(/\\n/g, '\n');
+
+    const times = [
+      n.created_at ? `<div><b>created</b>: ${n.created_at}</div>` : "",
+      n.started_at ? `<div><b>started</b>: ${n.started_at}</div>` : "",
+      n.finished_at ? `<div><b>finished</b>: ${n.finished_at}</div>` : "",
+    ].join("");
+
+    const links = [];
+    const m = n.meta || {};
+    const link = (label, path) => path ? `<a class="text-brand underline" href="/api/file?path=${encodeURIComponent(path)}" target="_blank">${label}</a>` : "";
+    if (m.metrics_path) links.push(link("metrics.json", m.metrics_path));
+    if (m.stdout_file) links.push(link("stdout", m.stdout_file));
+    if (m.stderr_file) links.push(link("stderr", m.stderr_file));
+    if (m.script_file) links.push(link("script", m.script_file));
+    if (m.path) links.push(link("file", m.path));
+    const filesHTML = links.length ? `<div class="mt-3"><h4 class="font-semibold mb-1 text-sm">Файлы</h4><div class="flex gap-3 text-sm flex-wrap">${links.join("")}</div></div>` : "";
+
+    panel.innerHTML = `
+      <div class="space-y-4">
+        <div>
+          <button class="btn w-full" onclick="renderModalNodesListFromCache()">← Назад к списку</button>
+        </div>
+        <div class="flex items-start gap-3">
+          <div class="text-2xl pt-1">${kindIcon(n.kind)}</div>
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              ${pill(n.status)}
+            </div>
+            <div class="text-sm mt-2"><b>kind</b>: ${n.kind || '-'}</div>
+            <div class="text-sm mt-1"><b>parent</b>: ${n.parent_node_id || '-'}</div>
+            <div class="text-sm mt-1"><b>children</b>: ${(n.children || []).length}</div>
+          </div>
+        </div>
+        <div>
+            <h4 class="font-semibold mb-1 text-sm">Task</h4>
+            <p class="text-sm bg-gray-50 p-2 rounded-lg break-words">${(n.task || '').replaceAll('<', '&lt;')}</p>
+        </div>
+        <div>
+            <h4 class="font-semibold mb-1 text-sm">Timestamps</h4>
+            <div class="grid grid-cols-1 gap-1 text-xs">${times}</div>
+        </div>
+        <div>
+          <h4 class="font-semibold mb-1 text-sm">Meta</h4>
+          <pre class="mono text-xs bg-gray-100 p-2 rounded-lg meta-pre max-h-60 overflow-auto">${meta}</pre>
+        </div>
+        ${filesHTML}
+      </div>
+    `;
+  } catch (e) {
+    console.error("Ошибка загрузки деталей узла в модальном окне:", e);
+    $("#graph-modal-nodes").innerHTML = `<div class="text-red-600 text-sm">Ошибка загрузки: ${e}</div>`;
+  }
+}
+window.showNodeDetailsInModal = showNodeDetailsInModal;
+
+// NEW: Helper to go back to the list view
+function renderModalNodesListFromCache() {
+    if (_modalD3_.layout) {
+        const items = _modalD3_.layout.descendants().map(d => d.data);
+        renderModalNodesList(items);
+        $("#graph-modal-panel-title").textContent = "Узлы";
+    }
+}
+window.renderModalNodesListFromCache = renderModalNodesListFromCache;
+
+/* --------------- open graph button --------------- */
+$("#btn-open-graph").onclick = ()=> openGraphModal( _SELECTED_?.node_id || _lastFocusId_);
+$("#btn-graph-close").onclick = closeGraphModal;
+
+/* ----------------- lifecycle ----------------- */
+document.addEventListener("DOMContentLoaded", async ()=>{
+  connectWS(); // fallback to SSE if fails
+  await loadEditors();
+  await loadConfigStructured();
+  renderTree();
+
+  $("#btn-start").onclick = startRun;
+  $("#btn-stop").onclick  = stopRun;
+  $("#btn-task-save").onclick = saveTask;
+  $("#btn-task-reload").onclick = reloadTask;
+  $("#btn-config-validate").onclick = validateConfig;
+  $("#btn-config-save").onclick = saveConfig;
+  $("#btn-config-reload").onclick = reloadConfig;
+  $("#btn-config-build-form").onclick = loadConfigStructured;
+  $("#btn-config-save-form").onclick = saveConfigStructured;
+  $("#search").oninput = (e)=> renderTree(e.target.value);
+
+  // Добавляем закрытие модального окна графика по клику на фон
+  $("#graph-modal").onclick = (e) => {
+    if (e.target === $("#graph-modal")) {
+        closeGraphModal();
+    }
+  };
+});
+  </script>
+</body>
+</html>

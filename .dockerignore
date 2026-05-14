@@ -1,0 +1,10 @@
+.venv/
+ml_project/
+artifacts/
+data/
+__pycache__/
+*.log
+.git/
+.idea/
+.pytest_cache/
+.benchmarks/
