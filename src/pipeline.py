@@ -1,23 +1,23 @@
 from __future__ import annotations
 
 import os
-import platform
 import re
+import platform
 import uuid
 import time
+import datetime
 import json
 import ast
-import csv
 import hashlib
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from colorama import Fore, init as colorama_init
 
 from src.helpers import _detect_and_store_submissions, _copy_text_file, _update_best_from_candidate, \
     _finalize_single_submission, _enforce_stack_guardrails, snapshot_data_tree, _deep_merge, validate_final_submission, \
-    run_final_output_gate, _finalize_single_submission_by_all_metrics_llm, materialize_project_root_submission_csv
+    run_final_output_gate, _finalize_single_submission_by_all_metrics_llm
 from src.utils import (shorten_string_middle, YAMLParseError, _parse_check_summary,
                        _rel_better, _ensure_dir, _slug, \
                        _validate_and_normalize_metrics, clean_specs, format_spec_constraints_block)
@@ -37,30 +37,19 @@ from src.prompts_agents import (
     perform_task_python_v2,
     finetune_code_v2,
     checks_generation,
-    aggregate_answers,
     check_answer,
+    aggregate_answers,
     fix_answer,
     verification_code_gen,
-    datapath_agent, datapath_consistency_check_agent, generate_tasks_with_retry, order_tasks_with_retry, checker_code_agent, improvement_tasks_generation,
+    datapath_agent, datapath_consistency_check_agent, generate_tasks_with_retry, order_tasks_with_retry,
+    checker_code_agent, improvement_tasks_generation,
     evaluate_run_ok_with_retry, lead_agent_propose_changes, lead_incident_manager_agent, implement_changes_agent,
     execution_predictor_agent, execution_watcher_agent, replanning_agent,
     review_artifacts_agent, improvement_replanning_agent, improver_head_agent,
-    meta_planner_agent, react_improver_meta_planner_agent,
-    log_update_agent, artifact_reviewer_agent,
-    metrics_recover_from_stdout, react_preexec_auditor_agent,
-    react_artifacts_collector_agent,
-    knowledge_curator_agent,
+    meta_planner_agent, react_improver_meta_planner_agent, log_update_agent, artifact_reviewer_agent,
+    metrics_recover_from_stdout,
 )
 from src.verification import FormalVerifier, VerificationSpec
-from src.artifact_tools import (
-    ensure_artifacts_repo,
-    snapshot_artifacts,
-    artifacts_diff_since,
-    build_schema_snapshot,
-    build_structured_artifact_tools,
-    write_artifacts_index,
-    CURATOR_MD_SCHEMA,
-)
 
 colorama_init(autoreset=True)
 
@@ -70,50 +59,6 @@ def _global_remaining_sec(orch: GlobalOrchestrator) -> int:
         getattr(orch, "global_deadline_sec", orch.cfg.orchestration.total_budget_sec)
     )
     return max(0, int(deadline - orch.effective_elapsed_sec()))
-
-
-
-def _json_roundtrip_safe(obj: Any) -> Any:
-    """
-    Convert objects to a JSON-serializable structure via roundtrip.
-    Paths and other custom objects are stringified.
-    """
-    return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
-
-
-# ---------------------------------------------------------------------------
-# Knowledge Curator call wrappers — synchronous "before" / fire-and-log "after".
-# These are the ONLY sanctioned paths to read/update artifacts/curator/*.md.
-# ---------------------------------------------------------------------------
-def _curator_before(orch: GlobalOrchestrator, llm_fast, llm_strong, role: str,
-                    task_hint: str = "", char_budget: int = 4500) -> str:
-    print(Fore.MAGENTA + f"[CURATOR] before(role={role}) invoked")
-    try:
-        out = knowledge_curator_agent(
-            llm_fast, llm_strong, orch,
-            role=role, task_hint=task_hint,
-            trigger="before", char_budget=char_budget,
-        )
-        print(Fore.MAGENTA + f"[CURATOR] before(role={role}) returned {len(out or '')} chars")
-        return out
-    except Exception as e:
-        print(Fore.YELLOW + f"[CURATOR] before({role}) failed: {e}")
-        return ""
-
-
-def _curator_after(orch: GlobalOrchestrator, llm_fast, llm_strong,
-                   role: str, task_hint: str, trigger: str,
-                   payload: Optional[Dict[str, Any]] = None) -> None:
-    print(Fore.MAGENTA + f"[CURATOR] {trigger}(role={role}) invoked")
-    try:
-        knowledge_curator_agent(
-            llm_fast, llm_strong, orch,
-            role=role, task_hint=task_hint,
-            trigger=trigger, event_payload=payload or {},
-        )
-        print(Fore.MAGENTA + f"[CURATOR] {trigger}(role={role}) done")
-    except Exception as e:
-        print(Fore.YELLOW + f"[CURATOR] {trigger}({role}) failed: {e}")
 
 
 def _audit_generated_code_policy(code_text: str) -> tuple[bool, list[str]]:
@@ -141,69 +86,15 @@ def _audit_generated_code_policy(code_text: str) -> tuple[bool, list[str]]:
         if s in low:
             issues.append(f"dangerous_op:{s}")
 
-    # Canonical curator .md files — only the Knowledge Curator agent may write.
-    for _cf in CURATOR_MD_SCHEMA.keys():
-        if _cf in low and ("write_text" in low or "open(" in low or "write(" in low):
-            issues.append(f"curator_md_write_forbidden:{_cf}")
-
-    # Protected pipeline control files — must never be written by generated code.
-    _protected_files = ("tree.json", "task_graph_events.jsonl", "spec.json")
-    import re as _re
-    for _pf in _protected_files:
-        # Match open()/write_text()/write()/json.dump targeting the protected file.
-        if _pf in low:
-            # open("tree.json", "w") / open("tree.json", "wb") patterns
-            _open_write = _re.search(
-                r'open\s*\([^)]*' + _re.escape(_pf) + r'[^)]*["\'],\s*["\']w',
-                low,
-            )
-            # write_text() always writes — no mode string needed
-            _write_text = _re.search(r'write_text\s*\(', low)
-            # json.dump() only writes to file when a 'w' mode file handle is present
-            _json_dump = _re.search(r'json\.dump\s*\(', low) and (
-                "'w'" in low or '"w"' in low
-            )
-            if _open_write or _write_text or _json_dump:
-                issues.append(f"protected_pipeline_file_write:{_pf}")
-
     # Spec hardcoding guardrail:
     # If script appears to define full spec-like dict, require dynamic load from artifacts/spec.json.
     looks_like_hardcoded_spec = (
-        ("primary_metric" in low and "submission" in low and "secondary_metrics" in low and "spec" in low)
-        and ("spec = {" in low or "spec={" in low or "spec = dict(" in low)
+            ("primary_metric" in low and "submission" in low and "secondary_metrics" in low and "spec" in low)
+            and ("spec = {" in low or "spec={" in low or "spec = dict(" in low)
     )
-    if "spec_json = '''" in low or "spec_json='''" in low or "spec_json = \"\"\"" in low:
-        looks_like_hardcoded_spec = True
-    if "spec_json" in low and "json.loads(spec_json" in low:
-        looks_like_hardcoded_spec = True
-    if "spec_json" in low and "primary_metric" in low and "submission" in low:
-        looks_like_hardcoded_spec = True
     has_dynamic_spec_read = ("artifacts/spec.json" in low) or ("spec.json" in low and "json.load" in low)
     if looks_like_hardcoded_spec and not has_dynamic_spec_read:
         issues.append("spec_hardcoded_without_dynamic_load")
-
-    # Anti-mocking guardrail (prevents agent from inventing data to bypass loading errors)
-    if "np.random." in low or "random.random" in low or "random.randint" in low:
-        # If it looks like it's creating a fake dataset instead of loading
-        if "pd.DataFrame(" in low and not (".read_csv(" in low or ".read_pickle(" in low or ".read_parquet(" in low):
-            issues.append("potential_data_mocking_detected")
-    
-    # Check for hardcoded metrics
-    if "METRICS_JSON" in low and ": {" in low:
-        if '"primary":' in low and not any(x in low for x in ("score", "metric", "accuracy", "rmse", "val_", "loss")):
-            # Very loose check, but might catch literal hardcoding like {"primary": 0.85}
-            import re
-            if re.search(r'"primary":\s*[0-9]\.[0-9]+', low):
-                if not re.search(r'[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*[0-9]\.[0-9]+', low): # no variable assignment
-                     issues.append("potential_hardcoded_metrics")
-
-    # Narrative/Large string literal check (blocks giant embedded MD reports that cause SyntaxErrors)
-    if '"""' in code_text or "'''" in code_text:
-        import re
-        # Find triple-quoted blocks longer than 3000 chars
-        large_blocks = re.findall(r'\"{3}[\s\S]{3000,}\"{3}|\'{3}[\s\S]{3000,}\'{3}', code_text)
-        if large_blocks:
-            issues.append("excessive_narrative_string_literals_detected")
 
     return (len(issues) == 0), issues
 
@@ -223,202 +114,6 @@ def _pipeline_effective_depth(orch: GlobalOrchestrator, depth: int, node_id: Opt
     return max(d0, td)
 
 
-def _persist_last_code_artifact(orch: GlobalOrchestrator, code_text: str) -> None:
-    """
-    Persist latest executable code to artifacts/last/code.py even when metrics are missing.
-    This prevents final gate failure for tasks requiring code artifact submission.
-    """
-    if not str(code_text or "").strip():
-        return
-    try:
-        root = Path(orch.project_root)
-        last_dir = root / orch.cfg.paths.artifacts_dir / "last"
-        _ensure_dir(last_dir)
-        orch.write_file(str(last_dir / "code.py"), code_text)
-    except Exception:
-        pass
-
-
-def _agentic_repair_verifier_code(
-    code_llm,
-    spec: Dict[str, Any],
-    initial_code: str,
-    context: str,
-    mcp_tools: Optional[List[Any]],
-    max_attempts: int = 3,
-) -> str:
-    """
-    Agent-first verifier repair loop.
-    Instead of static fallback code, ask coder agent to fix verifier code using
-    policy issues + task context + tool access.
-    """
-    candidate = str(initial_code or "")
-    for attempt in range(max(1, int(max_attempts))):
-        ok, issues = _audit_generated_code_policy(candidate)
-        if ok and candidate.strip():
-            return candidate
-
-        repair_task = (
-            "Repair this Python verifier script so it is executable and policy-compliant. "
-            "Must dynamically read artifacts/spec.json (no hardcoded spec), inspect existing artifacts, "
-            "and print exactly one METRICS_JSON line. "
-            "If spec.json is malformed/missing, recover robustly by reading existing metrics/checkpoints and "
-            "emit valid skipped metrics only as last resort. "
-            "Use canonical project-root artifacts paths only."
-        )
-        repair_ctx = (
-            f"Verifier repair attempt {attempt + 1}/{max_attempts}\n"
-            f"Policy issues: {issues}\n"
-            f"{context}\n"
-            "The script may inspect filesystem with tools first, then rewrite full standalone verifier code."
-        )
-        candidate = perform_task_python_v2(
-            code_llm,
-            repair_task,
-            spec or {},
-            previous_code=candidate,
-            context=repair_ctx,
-            tools=mcp_tools,
-        )
-        candidate = str(candidate or "").replace("```python", "").replace("```", "").strip()
-    return candidate
-
-
-def _attempt_output_gate_recovery(
-    orch: GlobalOrchestrator,
-    llm_fast,
-    code_llm,
-    spec: Dict[str, Any],
-    task: str,
-    gate_errors: List[str],
-    mcp_tools: Optional[List[Any]],
-) -> Dict[str, Any]:
-    """
-    Last-chance autonomous recovery before hard-failing output gate:
-    - generate and run a focused recovery script via prompt+tools
-    - try metrics recovery
-    - materialize canonical submission and rerun gate
-    """
-    print(Fore.YELLOW + "[FINAL][RECOVERY] output gate failed, attempting autonomous recovery...")
-    rec_task = (
-        "FINAL RECOVERY: produce canonical submission.csv and metrics artifacts for this run. "
-        "Read spec dynamically from artifacts/spec.json; never hardcode spec dict; "
-        "write submission to canonical location and print METRICS_JSON."
-    )
-    rec_ctx = (
-        "Output gate errors:\n- " + "\n- ".join(gate_errors or []) + "\n\n"
-        "Use available artifacts/checkpoints/preds if they exist. "
-        "If no trained model exists, run the fastest valid baseline to produce a real submission. "
-        "Do not create fake helper submissions."
-    )
-    rec_code = perform_task_python_v2(
-        code_llm,
-        rec_task,
-        spec or {},
-        previous_code="",
-        context=rec_ctx + f"\nOriginal task: {task}",
-        tools=mcp_tools,
-        orch=orch,
-    )
-    clean_rec_code = str(rec_code or "").replace("```python", "").replace("```", "").strip()
-    _persist_last_code_artifact(orch, clean_rec_code)
-
-    if clean_rec_code:
-        rec_res = orch.code_executor(clean_rec_code, spec=spec or {})
-        rec_stdout = rec_res.get("output", "") or ""
-        rec_metrics = parse_metrics_from_stdout(rec_stdout) or {}
-        if not rec_metrics:
-            try:
-                verif_code = verification_code_gen(
-                    code_llm,
-                    spec,
-                    context="Recover METRICS_JSON from existing artifacts after final recovery attempt.",
-                )
-                _v_ok, _v_issues = _audit_generated_code_policy(verif_code)
-                if not _v_ok:
-                    print(Fore.YELLOW + f"[FINAL][RECOVERY] verifier code blocked by policy: {_v_issues}; invoking agentic verifier repair")
-                    verif_code = _agentic_repair_verifier_code(
-                        code_llm=code_llm,
-                        spec=spec or {},
-                        initial_code=verif_code,
-                        context=(
-                            "Recover METRICS_JSON from existing artifacts after output-gate failure. "
-                            "Do not hardcode spec; fix verifier code using filesystem evidence."
-                        ),
-                        mcp_tools=mcp_tools,
-                    )
-                verif_res = orch.code_executor(verif_code, "metric_check.py")
-                rec_metrics = parse_metrics_from_stdout(verif_res.get("output", "") or "") or {}
-            except Exception:
-                rec_metrics = {}
-        if rec_metrics and rec_metrics.get("type") != "skipped":
-            try:
-                _update_best_from_candidate(
-                    orch,
-                    candidate_metrics=rec_metrics,
-                    code_text=clean_rec_code,
-                    tag="final_recovery",
-                    spec=spec,
-                )
-            except Exception:
-                pass
-
-    try:
-        materialize_project_root_submission_csv(orch)
-    except Exception:
-        pass
-    return run_final_output_gate(orch, spec or {}, task_txt_root=Path(orch.project_root))
-
-
-def _reconcile_submission_columns_from_sample(orch: GlobalOrchestrator, spec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Prefer real sample_submission header over LLM guess for spec.submission.columns.
-    This prevents one-column hallucinations like ['Insult'] when sample has ['Comment','Insult'].
-    """
-    if not isinstance(spec, dict):
-        return spec
-    root = Path(orch.project_root)
-    data = spec.get("data", {}) if isinstance(spec.get("data"), dict) else {}
-    candidates: List[Path] = []
-    raw = str(data.get("sample_submission_csv") or data.get("sample_submission") or "").strip()
-    if raw:
-        p = Path(raw)
-        candidates.append(p if p.is_absolute() else (root / p))
-    resolved_root = str(data.get("resolved_root") or "").strip()
-    if resolved_root:
-        candidates.append(Path(resolved_root) / "sample_submission.csv")
-    candidates.append(root / "data" / "sample_submission.csv")
-
-    sample_path: Optional[Path] = None
-    for p in candidates:
-        try:
-            if p.exists() and p.is_file():
-                sample_path = p
-                break
-        except Exception:
-            continue
-    if sample_path is None:
-        return spec
-
-    try:
-        with sample_path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-            reader = csv.reader(f)
-            header = [str(h).strip() for h in (next(reader, None) or [])]
-    except Exception:
-        return spec
-    if not header:
-        return spec
-
-    sub = spec.get("submission", {}) if isinstance(spec.get("submission"), dict) else {}
-    old_cols = [str(c).strip() for c in (sub.get("columns") or [])]
-    if old_cols != header:
-        sub["columns"] = header
-        sub.setdefault("delimiter", ",")
-        spec["submission"] = sub
-        print(Fore.YELLOW + f"[SPEC] submission.columns reconciled from sample_submission header: {header}")
-    return spec
-
-
 def _normalize_plan_tail_entries(raw: List[Any], default_tb: int) -> List[Dict[str, Any]]:
     """Replan / ordering may return dicts or bare strings."""
     out: List[Dict[str, Any]] = []
@@ -433,102 +128,6 @@ def _normalize_plan_tail_entries(raw: List[Any], default_tb: int) -> List[Dict[s
         elif isinstance(x, str) and x.strip():
             out.append({"task": x.strip(), "time_budget_sec": db})
     return out
-
-
-def _sanitize_triage_bash_cmds(cmds: List[Any]) -> List[str]:
-    """
-    Block dangerous triage bash commands that can kill the orchestrator itself.
-    Keep only minimally safe filesystem/process-inspection commands.
-    """
-    safe: List[str] = []
-    for raw in (cmds or []):
-        cmd = str(raw or "").strip()
-        if not cmd:
-            continue
-        low = cmd.lower()
-
-        # Hard block broad Python process kills that can terminate this very run.
-        blocked_patterns = (
-            "get-process python | stop-process",
-            "stop-process -name python",
-            "taskkill /im python",
-            "pkill -f python",
-            "killall python",
-        )
-        if any(p in low for p in blocked_patterns):
-            print(Fore.YELLOW + f"[TRIAGE/BASH] blocked unsafe command: {cmd}")
-            continue
-
-        # Allow explicit PID kill only for non-current process.
-        if ("stop-process" in low or "taskkill" in low or " kill " in f" {low} ") and ("-id" in low or "/pid" in low):
-            safe.append(cmd)
-            continue
-
-        # Common safe commands for triage.
-        safe_prefixes = (
-            "dir", "ls", "get-childitem", "test-path", "resolve-path", "where", "which",
-            "expand-archive", "new-item", "move-item", "copy-item", "python ", "powershell ",
-        )
-        if low.startswith(safe_prefixes):
-            safe.append(cmd)
-            continue
-
-        # Unknown process/system command -> skip.
-        if any(x in low for x in ("stop-process", "taskkill", "pkill", "killall", "kill ")):
-            print(Fore.YELLOW + f"[TRIAGE/BASH] blocked process-kill command: {cmd}")
-            continue
-        safe.append(cmd)
-    return safe
-
-
-def _verify_dependency_claims(orch: "GlobalOrchestrator", issues: List[str]) -> List[str]:
-    """
-    Verify "Missing dependency" claims by actually importing the package.
-    Returns the filtered list with false positives removed.
-    """
-    import re as _re
-    # Matches: "Missing critical dependency: pandas", "No module named numpy",
-    # "Missing package: sklearn", "pandas is not installed"
-    _dep_patterns = [
-        _re.compile(r"[Mm]issing\b.*?(?:dependency|package|module|import)[:\s]+(\w[\w.-]*)", _re.IGNORECASE),
-        _re.compile(r"[Nn]o module named ['\"]?(\w[\w.-]*)", _re.IGNORECASE),
-        _re.compile(r"(\w[\w.-]*)\s+is not installed", _re.IGNORECASE),
-    ]
-    verified: List[str] = []
-    for issue in issues:
-        m = None
-        for pat in _dep_patterns:
-            m = pat.search(issue)
-            if m:
-                break
-        if not m:
-            verified.append(issue)
-            continue
-        pkg_name = m.group(1).strip().rstrip(".")
-        # Map common import names to their actual import module
-        _import_name = {
-            "scikit-learn": "sklearn",
-            "opencv-python": "cv2",
-            "pillow": "PIL",
-            "pyyaml": "yaml",
-            "python-dotenv": "dotenv",
-            "beautifulsoup4": "bs4",
-        }.get(pkg_name, pkg_name)
-        try:
-            res = orch.run_python_code(
-                f"import {_import_name}; print('ok')",
-                filename=f"_dep_check_{_import_name}.py",
-                timeout=15,
-            )
-            if res.get("exit_code", 1) == 0 and "ok" in (res.get("output", "") or ""):
-                print(Fore.GREEN + f"[PREFLIGHT/VERIFY] '{pkg_name}' IS available — removing false positive")
-                continue  # Package works fine, skip this issue
-        except Exception:
-            pass
-        verified.append(issue)
-    if len(verified) < len(issues):
-        print(Fore.GREEN + f"[PREFLIGHT/VERIFY] Removed {len(issues) - len(verified)} false dependency claims")
-    return verified
 
 
 _DEFAULT_CLASSIFICATION_SECONDARY: tuple[str, ...] = (
@@ -601,32 +200,32 @@ def merge_default_secondary_metrics(spec: Dict[str, Any]) -> Dict[str, Any]:
     existing_l = [x.lower() for x in existing]
 
     is_cls = (
-        pname
-        in (
-            "accuracy",
-            "f1",
-            "f1_macro",
-            "f1_weighted",
-            "balanced_accuracy",
-            "cohen_kappa",
-            "log_loss",
-        )
-        or pname in ("auc", "roc_auc", "pr_auc", "average_precision")
-        or any("confusion" in x for x in existing_l)
-        or any(x.startswith("f1") for x in existing_l)
-        or any(x.startswith("precision") for x in existing_l)
-        or any(x.startswith("recall") for x in existing_l)
+            pname
+            in (
+                "accuracy",
+                "f1",
+                "f1_macro",
+                "f1_weighted",
+                "balanced_accuracy",
+                "cohen_kappa",
+                "log_loss",
+            )
+            or pname in ("auc", "roc_auc", "pr_auc", "average_precision")
+            or any("confusion" in x for x in existing_l)
+            or any(x.startswith("f1") for x in existing_l)
+            or any(x.startswith("precision") for x in existing_l)
+            or any(x.startswith("recall") for x in existing_l)
     )
     is_regr = (
-        pname in ("rmse", "mse", "mae", "r2", "r_squared", "mape", "rmsle", "msle", "smape")
-        or "rmse" in pname
-        or "mae" in pname
-        or pname.endswith("_error")
-        or any(x in ("rmse", "mae", "r2", "rmsle") for x in existing_l)
+            pname in ("rmse", "mse", "mae", "r2", "r_squared", "mape", "rmsle", "msle", "smape")
+            or "rmse" in pname
+            or "mae" in pname
+            or pname.endswith("_error")
+            or any(x in ("rmse", "mae", "r2", "rmsle") for x in existing_l)
     )
     is_mll = (
-        any(x in ("hamming_loss", "subset_accuracy") for x in existing_l)
-        or "multilabel" in json.dumps(spec.get("modalities", [])).lower()
+            any(x in ("hamming_loss", "subset_accuracy") for x in existing_l)
+            or "multilabel" in json.dumps(spec.get("modalities", [])).lower()
     )
 
     defaults: tuple[str, ...] = ()
@@ -681,111 +280,6 @@ def _track_node(orch: GlobalOrchestrator,
 
 # -------------------- checker-driven post validation --------------------
 
-def _extract_fixed_aggregate_report(stdout: str) -> Optional[str]:
-    """Parse revised report from fix_answer-generated script stdout."""
-    import re
-
-    if not (stdout or "").strip():
-        return None
-    m = re.search(
-        r"AGGREGATE_REPORT_BEGIN\s*\r?\n(.*?)\r?\nAGGREGATE_REPORT_END",
-        stdout,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if not m:
-        return None
-    body = (m.group(1) or "").strip()
-    return body or None
-
-
-_ARTIFACT_EXTS = (
-    r"parquet|csv|json|npy|npz|pkl|pickle|joblib|pt|pth|bin|h5|hdf5|"
-    r"feather|arrow|tsv|txt|zip|tar|gz|yaml|yml"
-)
-_PATH_TOKEN = rf"['\"`]?([^\s'\"`,\)\]<>]+\.(?:{_ARTIFACT_EXTS}))['\"`]?"
-
-_ARTIFACT_SAVE_PATTERNS = [
-    # "saved to <path>", "saved at <path>", "saved ... to <path>"
-    # Allow up to ~60 chars between 'save' and the preposition so phrases like
-    # "saved the engineered features to <path>" match too.
-    re.compile(rf"(?i)\bsave[ds]?\b[^\n]{{0,60}}?\s(?:to|at|as|into|in)\s+{_PATH_TOKEN}"),
-    # "writing <path>", "wrote <path>"
-    re.compile(rf"(?i)\b(?:writing|wrote)\s+{_PATH_TOKEN}"),
-    # "dumped to <path>"
-    re.compile(rf"(?i)\b(?:dump(?:ed)?|exported?)\b[^\n]{{0,60}}?\s(?:to|at|into|as)\s+{_PATH_TOKEN}"),
-    # "-> <path>", "→ <path>"
-    re.compile(rf"(?:->|→)\s*{_PATH_TOKEN}"),
-    # "output: <path>", "artifact: <path>"
-    re.compile(rf"(?i)\b(?:output|artifact|file|path|result|checkpoint)\s*[:=]\s*{_PATH_TOKEN}"),
-]
-
-
-def _verify_claimed_artifacts(orch: GlobalOrchestrator, text_blobs: List[str]) -> Dict[str, List[str]]:
-    """
-    Scan the provided text blobs (stdout tails / project log) for claimed
-    artifact saves and check which of those files actually exist on disk.
-
-    Returns:
-        {
-            "verified": [<relative paths that exist>],
-            "missing":  [<relative paths claimed but not found>],
-        }
-
-    Motivation: the aggregate agent has been observed to copy filenames from
-    the task description as if they were saved, producing bogus summaries
-    that blocked downstream preflight. Passing verified/missing evidence to
-    the agent lets us hard-require file-path provenance.
-    """
-    root = Path(orch.project_root).resolve()
-    seen: Dict[str, bool] = {}
-    found_order: List[str] = []
-    for blob in text_blobs:
-        if not blob:
-            continue
-        for pat in _ARTIFACT_SAVE_PATTERNS:
-            for m in pat.finditer(blob):
-                raw = (m.group(1) or "").strip().strip(".,;:")
-                if not raw:
-                    continue
-                # Normalise slashes and skip obvious URLs.
-                if "://" in raw:
-                    continue
-                norm = raw.replace("\\", "/")
-                if norm in seen:
-                    continue
-                seen[norm] = True
-                found_order.append(norm)
-
-    verified: List[str] = []
-    missing: List[str] = []
-    for claim in found_order:
-        candidate = Path(claim)
-        if not candidate.is_absolute():
-            candidate = root / claim
-        try:
-            resolved = candidate.resolve()
-        except Exception:
-            missing.append(claim)
-            continue
-        try:
-            resolved.relative_to(root)
-        except ValueError:
-            # Path escapes project_root — skip silently; not our business.
-            continue
-        if resolved.exists() and resolved.is_file():
-            try:
-                rel = resolved.relative_to(root).as_posix()
-            except ValueError:
-                rel = str(resolved)
-            verified.append(rel)
-        else:
-            missing.append(claim)
-    # De-duplicate while preserving order.
-    verified = list(dict.fromkeys(verified))
-    missing = list(dict.fromkeys(missing))
-    return {"verified": verified, "missing": missing}
-
-
 def check_and_fix_answer(
         orch: GlobalOrchestrator,
         llm_fast,
@@ -834,12 +328,10 @@ def check_and_fix_answer(
         }
         return initial_answer
 
-    checker_holder: Dict[str, str] = {"code": checker_code, "name": checker_name}
-
     def run_checker() -> Dict[str, Any]:
         res = orch.run_python_code(
-            checker_holder["code"],
-            filename=checker_holder["name"],
+            checker_code,
+            filename=checker_name,
             timeout=min(orch.cfg.runtime.checker_timeout_cap_sec, orch.cfg.runtime.code_timeout_sec)
         )
         orch.log("checker_run", {
@@ -883,28 +375,6 @@ def check_and_fix_answer(
             "fail_rate_before": fail_rate
         })
 
-        fixed_report = _extract_fixed_aggregate_report(exec_res.get("output") or "")
-        if fixed_report:
-            current_answer = fixed_report
-
-        refreshed = checker_code_agent(
-            llm_fast,
-            task=task,
-            spec=spec,
-            code_summary=code_summary,
-            final_answer=current_answer,
-            metrics_json=metrics_json,
-            stdout_tail=stdout_tail[-4000:],
-            stderr_tail=stderr_tail[-4000:],
-            improvement_summary=improvement_summary[-4000:],
-        )
-        _ok_ref, _ref_issues = _audit_generated_code_policy(refreshed)
-        if not _ok_ref:
-            orch.log("checker_refresh_blocked_by_policy", {"issues": _ref_issues})
-            break
-        checker_holder["code"] = refreshed
-        checker_holder["name"] = f"check_{uuid.uuid4().hex[:6]}.py"
-
         summary = run_checker()
         total = int(summary.get("total", 0) or 0)
         failed = int(summary.get("failed", 0) or 0)
@@ -935,22 +405,8 @@ def improvement_generate_and_execute(
         mcp_tools: List[Any] = None,
 ) -> Dict[str, Any]:
     with _track_node(orch, node_id, parent_node_id, kind="improve_leaf", task=task) as leaf_id:
-        incident_node_id = str(leaf_id) if leaf_id else f"adhoc_{hashlib.md5((task or '').encode('utf-8')).hexdigest()[:10]}"
-        # Modality-aware schema + artifact tools for improver coder
-        try:
-            _schema_snapshot = build_schema_snapshot(orch, frozen_spec) or ""
-        except Exception:
-            _schema_snapshot = ""
-        try:
-            _art_tools = build_structured_artifact_tools(orch) or []
-        except Exception:
-            _art_tools = []
-        if mcp_tools is None:
-            mcp_tools = []
-        _existing_names = {getattr(t, "name", "") for t in mcp_tools}
-        for _t in _art_tools:
-            if getattr(_t, "name", "") not in _existing_names:
-                mcp_tools.append(_t)
+        incident_node_id = str(
+            leaf_id) if leaf_id else f"adhoc_{hashlib.md5((task or '').encode('utf-8')).hexdigest()[:10]}"
         # Comment translated to English.
         art_dir = Path(orch.cfg.paths.artifacts_dir)
         iter_dir = Path(orch.project_root) / art_dir / "improve" / f"iter_{iter_idx:02d}"
@@ -967,11 +423,10 @@ def improvement_generate_and_execute(
         improve_guidelines = (
             "IMPROVE_MODE RULES:\n"
             "1. **DATA INTEGRITY**: Load the FULL dataset from `spec.data`. NEVER use `nrows=...`, `.sample(...)`, or `head(...)` for training data loading. We need the full data.\n"
-            "2. **MONOLITH PREFERENCE**: In competition mode, prefer a single unified code artifact for training/validation/prediction. Avoid fragile chains of multiple scripts unless the logic is extremely large (>1000 lines).\n"
-            "3. **ARTIFACT SPECIFICATION**: Before using artifacts (e.g. .pkl, .csv), check `project_context.md` for their ACTUAL structure (columns, dict keys). Do NOT guess filenames or column names. If a file exists, use its verified name from context.\n"
-            "4. **PATHS**: Keep input/output paths strictly from `spec` or `project_context.md`.\n"
-            "5. **VALIDATION**: Preserve the CV protocol. If GroupKFold is used, ensure groups are respected.\n"
-            "6. **METRICS**: You MUST calculate and print the metric defined in `spec['primary_metric']` as JSON to stdout.\n"
+            "2. **CONTINUITY**: Start from the existing code logic (provided in context). Do NOT rebuild from scratch unless necessary.\n"
+            "3. **PATHS**: Keep input/output paths strictly from `spec`. Do NOT change submission schema.\n"
+            "4. **VALIDATION**: Preserve the CV protocol. If GroupKFold is used, ensure groups are respected.\n"
+            "5. **METRICS**: You MUST calculate and print the metric defined in `spec['primary_metric']` as JSON to stdout.\n"
         )
 
         guidance_ctx = improve_guidelines + "\n" + (previous_answers or "")
@@ -996,9 +451,7 @@ def improvement_generate_and_execute(
                 code_llm, task, frozen_spec,
                 previous_code=code_bank[-1] if code_bank else "",
                 context=guidance_ctx + f"Target Metric: {frozen_spec['primary_metric']['name']}",
-                tools=mcp_tools,
-                orch=orch,
-                schema_snapshot=_schema_snapshot,
+                tools=mcp_tools
             )
 
             clean_code = answer_code.replace("```python", "").replace("```", "").strip()
@@ -1022,52 +475,17 @@ def improvement_generate_and_execute(
         last_stdout, last_errors = "", ""
         retry = 0
         metrics = {}
-        _seen_improver_err_sigs: Dict[str, int] = {}  # error dedup within this task
+
+        last_exit_code = 0
+        last_time_prediction = 0
+        last_time_strict = 0
+        last_actual_time = 0
+        code_exec_tries = 0
 
         while True:
-            preflight = react_preexec_auditor_agent(
-                llm_fast=llm_fast,
-                orch=orch,
-                task=task,
-                spec=frozen_spec,
-                code_text=answer_code,
-                context="Improver pre-execution audit. Inspect task_plan and artifacts before allowing run.",
-            )
-            allow_run = bool(preflight.get("allow_run", True))
-            planning_only = bool(preflight.get("planning_only", False))
-            preflight_issues = [str(x) for x in (preflight.get("issues") or [])]
-            if planning_only:
-                preflight_issues.append("planning_only_task_detected")
-
-            # ── Verify "Missing dependency" claims programmatically ──
-            if preflight_issues:
-                preflight_issues = _verify_dependency_claims(orch, preflight_issues)
-                if not preflight_issues:
-                    allow_run = True
-
-            if not allow_run or preflight_issues:
-                print(Fore.YELLOW + f"[IMPROVER/PREFLIGHT][AGENT] blocked: {preflight_issues}")
-                answer_code = finetune_code_v2(
-                    code_llm,
-                    task,
-                    answer_code,
-                    frozen_spec,
-                    error=(
-                        "Agentic preflight blocked execution. Fix all issues: "
-                        + "; ".join(preflight_issues)
-                        + ". Follow required_fixes and evidence from preflight, then regenerate executable code."
-                    ),
-                    tools=mcp_tools,
-                )
-                retry += 1
-                if retry > max(2, int(getattr(orch.cfg.runtime, "generation_retry_limit", 6) or 6)):
-                    print(Fore.RED + "[IMPROVER/PREFLIGHT] Retry limit exceeded for path-policy fixes.")
-                    break
-                continue
-
+            code_exec_tries += 1
             # Comment translated to English.
             orch.write_file(scr_rel, answer_code.replace("```", "").replace("python", ""))
-            _persist_last_code_artifact(orch, answer_code.replace("```", "").replace("python", ""))
             try:
                 # Comment translated to English.
                 _copy_text_file(orch, Path(orch.project_root) / scr_rel, iter_dir / "scripts" / scr_name)
@@ -1079,40 +497,43 @@ def improvement_generate_and_execute(
             # Predict execution time
             prediction = execution_predictor_agent(llm_fast, answer_code, frozen_spec)
 
-            # Per-task budget is the SOFT TARGET passed to the bash agent.
-            # The bash agent will expand it up to `hard_cap` (run-wide remaining)
-            # when the predictor says the step needs more — see bash_agent.run.
+            # Figure out strict timeout limits
             task_node = orch.tree_node(leaf_id) if leaf_id else {}
             task_budget = task_node.get("time_budget_sec", orch.cfg.runtime.default_task_budget_sec)
 
             predicted_time = prediction.get('expected_time_sec', orch.cfg.runtime.prediction_fallback_sec)
+            predicted_with_buffer = int(predicted_time * 1.2)
 
-            # Recalculate remaining time for logging only — the actual hard
-            # cap is computed inside orchestrator.run_python_file from the
-            # global deadline, so we don't pre-clamp here.
+            # Recalculate remaining time right before execution
             current_remaining = getattr(
                 orch, "global_deadline_sec", orch.cfg.orchestration.total_budget_sec
             ) - orch.effective_elapsed_sec()
 
-            floor = orch.cfg.runtime.min_exec_timeout_sec
-            soft_target = max(int(floor), int(task_budget))
-
-            print(
-                Fore.CYAN
-                + f"[IMPROVER/MONITOR] Predicted time: {predicted_time}s, "
-                + f"Intensity: {prediction.get('resource_intensity')}. "
-                + f"Soft target: {soft_target}s, hard_cap≈{int(max(0, current_remaining))}s, "
-                + f"floor={floor}s (predictor may expand within hard_cap)"
+            # Choose the strictest reasonable timeout
+            strict_timeout = min(
+                task_budget,
+                predicted_with_buffer,
+                max(orch.cfg.runtime.min_exec_timeout_sec, int(current_remaining)),
             )
 
+            print(
+                Fore.CYAN + f"[IMPROVER/MONITOR] Predicted time: {predicted_time}s, Intensity: {prediction.get('resource_intensity')}. Enforcing absolute timeout: {strict_timeout}s."
+            )
+            last_time_prediction = predicted_time
+            last_time_strict = strict_timeout
+
+            start = datetime.datetime.now(datetime.UTC)
             res = orch.run_python_file(
                 scr_rel,
                 stream=True,
                 spec=frozen_spec,
                 prediction=prediction,
-                timeout=soft_target,
+                timeout=strict_timeout
             )
+            end = datetime.datetime.now(datetime.UTC)
+            last_actual_time = (end - start).total_seconds()
             last_stdout, last_errors = res.get("output", ""), res.get("errors", "")
+            last_exit_code = res.get("exit_code", 1)
 
             # Comment translated to English.
             try:
@@ -1127,41 +548,9 @@ def improvement_generate_and_execute(
             # Comment translated to English.
             metrics = parse_metrics_from_stdout(last_stdout) or {}
 
-            art_summary = ""
-            try:
-                art_summary = update_project_context_after_execution(orch, task, last_stdout, last_errors, metrics, answer_code)
-            except Exception as e:
-                print(Fore.RED + f"Failed to update project context: {e}")
-
             # Comment translated to English.
             if metrics.get('type') == 'skipped':
                 print(Fore.CYAN + f"[IMPROVER] Task skipped by model: {metrics.get('reason', 'No reason')}")
-                preflight_after = react_preexec_auditor_agent(
-                    llm_fast=llm_fast,
-                    orch=orch,
-                    task=task,
-                    spec=frozen_spec,
-                    code_text=answer_code,
-                    context="Detect planning-only output after skipped METRICS_JSON.",
-                )
-                if bool(preflight_after.get("planning_only", False)):
-                    print(Fore.YELLOW + "[IMPROVER] planning-only task detected; forcing executable recovery task.")
-                    answer_code = perform_task_python_v2(
-                        code_llm,
-                        "Inspect artifacts/checkpoints and produce canonical submission.csv + METRICS_JSON for current iteration",
-                        frozen_spec,
-                        previous_code=answer_code,
-                        context=(
-                            guidance_ctx
-                            + "\nAvoid planning-only output. Must execute code and create concrete artifacts."
-                        ),
-                        tools=mcp_tools,
-                        orch=orch,
-                        schema_snapshot=_schema_snapshot,
-                    )
-                    retry += 1
-                    if retry <= max(2, int(getattr(orch.cfg.runtime, "metric_validation_retry_limit", 2) or 2)):
-                        continue
                 # Comment translated to English.
                 if heuristic_ok:
                     break
@@ -1183,25 +572,9 @@ def improvement_generate_and_execute(
             if llm_ok:
                 break
 
-            # ── Error-signature dedup (improver) ──────────────────────────────
-            if last_errors:
-                _ierr_sig = (last_errors or "").strip()[:200]
-                _seen_improver_err_sigs[_ierr_sig] = _seen_improver_err_sigs.get(_ierr_sig, 0) + 1
-                if _seen_improver_err_sigs[_ierr_sig] >= 3:
-                    print(Fore.RED + f"[IMPROVER/TRIAGE] Same error seen {_seen_improver_err_sigs[_ierr_sig]}x — forcing lead escalation.")
-                    plan = router.route(last_errors, last_stdout, frozen_spec, answer_code)
-                    plan["route"] = "lead"
-                    plan["reason"] = (
-                        f"Error repeated {_seen_improver_err_sigs[_ierr_sig]} times. "
-                        + plan.get("reason", "")
-                    )
-                    route = "lead"
-                else:
-                    plan = router.route(last_errors, last_stdout, frozen_spec, answer_code)
-                    route = plan.get("route", "coding")
-            else:
-                plan = router.route(last_errors, last_stdout, frozen_spec, answer_code)
-                route = plan.get("route", "coding")
+            # Comment translated to English.
+            plan = router.route(last_errors, last_stdout, frozen_spec, answer_code)
+            route = plan.get("route", "coding")
             attempts_hist = []
             try:
                 attempts_hist = (orch.state_get(incident_node_id) or {}).get("attempts", []) or []
@@ -1221,7 +594,8 @@ def improvement_generate_and_execute(
                 if isinstance(managed_plan, dict) and managed_plan.get("route"):
                     plan = managed_plan
                     route = plan.get("route", route)
-            print(Fore.YELLOW + f"[IMPROVER/TRIAGE] attempts={len(attempts_hist)} route={route} reason={plan.get('reason', '')}")
+            print(
+                Fore.YELLOW + f"[IMPROVER/TRIAGE] attempts={len(attempts_hist)} route={route} reason={plan.get('reason', '')}")
             orch.state_append_attempt(incident_node_id, {
                 "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 "phase": "triage",
@@ -1242,15 +616,9 @@ def improvement_generate_and_execute(
                         "exit_code": install_res.get("exit_code", 1),
                         "stderr_tail": str(install_res.get("stderr", ""))[-1000:],
                     })
-                    if install_res.get("exit_code", 1) != 0:
+                    if int(install_res.get("exit_code", 1) or 1) != 0:
                         last_errors = f"{install_res.get('stderr', '')}\n{install_res.get('stdout', '')}"
                         print(Fore.RED + "[IMPROVER/TRIAGE] install failed; re-triaging based on pip output.")
-                        # Track per-package failures so router can stop retrying hopeless packages.
-                        if hasattr(router, "_install_fail_counts"):
-                            for _pkg in pkgs:
-                                _pk = (_pkg or "").lower().strip()
-                                if _pk:
-                                    router._install_fail_counts[_pk] = router._install_fail_counts.get(_pk, 0) + 1
                         retry += 1
                         if retry > orch.cfg.runtime.router_retry_limit:
                             print(Fore.RED + "[IMPROVER] Retry limit exceeded after install failures.")
@@ -1266,13 +634,11 @@ def improvement_generate_and_execute(
                     code_llm, task, frozen_spec,
                     previous_code=code_bank[-1] if code_bank else "",
                     context=improve_guidelines + "\n" + guidance + "\nPREV_ERROR:\n" + last_errors[:1200],
-                    tools=mcp_tools,
-                    orch=orch,
-                    schema_snapshot=_schema_snapshot,
+                    tools=mcp_tools
                 )
 
             elif route == "bash":
-                for cmd in _sanitize_triage_bash_cmds(plan.get("bash_cmds", [])):
+                for cmd in plan.get("bash_cmds", []):
                     print(Fore.CYAN + f"[BASH] {cmd}")
                     orch.bash.run(cmd, timeout=orch.cfg.runtime.bash_timeout_sec, stream=True)
                     orch.state_append_attempt(incident_node_id, {
@@ -1285,18 +651,15 @@ def improvement_generate_and_execute(
                 answer_code = finetune_code_v2(
                     code_llm, task, answer_code, frozen_spec,
                     error="Bash commands executed. Now fix the code if needed.\n" + last_errors
-                , tools=mcp_tools)
+                    , tools=mcp_tools)
 
             elif route == "lead":
                 note = plan.get("notes", "")
                 answer_code = perform_task_python_v2(
                     code_llm, task, frozen_spec,
                     previous_code=code_bank[-1] if code_bank else "",
-                    context=improve_guidelines + "\nLEAD_ADVICE: " + note,
-                    tools=mcp_tools,
-                    orch=orch,
-                    schema_snapshot=_schema_snapshot,
-                )
+                    context=improve_guidelines + "\nLEAD_ADVICE: " + note
+                    , tools=mcp_tools)
 
             else:  # coding
                 answer_code = finetune_code_v2(
@@ -1311,9 +674,9 @@ def improvement_generate_and_execute(
                 answer_code = finetune_code_v2(
                     code_llm, task, answer_code, frozen_spec,
                     error=(
-                        "Code policy violation detected: "
-                        + "; ".join(_issues_new)
-                        + ". Remove destructive operations and load spec dynamically from artifacts/spec.json."
+                            "Code policy violation detected: "
+                            + "; ".join(_issues_new)
+                            + ". Remove destructive operations and load spec dynamically from artifacts/spec.json."
                     ),
                     tools=mcp_tools
                 )
@@ -1330,6 +693,25 @@ def improvement_generate_and_execute(
         except Exception:
             pass
 
+        # Check and fix generated code before finalizing submission.
+        # Catches metric corruption (e.g. impossible log_loss values) and format errors
+        # (e.g. missing required columns) that the triage loop cannot detect on its own.
+        try:
+            answer_code = check_and_fix_answer(
+                orch, llm_fast,
+                task=task,
+                initial_answer=answer_code,
+                spec=frozen_spec,
+                node_id=str(leaf_id),
+                only_root=False,
+                metrics_json=json.dumps(metrics or {}),
+                stdout_tail=last_stdout[-3000:],
+                stderr_tail=last_errors[-1000:],
+                quiet=False,
+            )
+        except Exception as e:
+            print(Fore.YELLOW + f"[CHECK] check_and_fix_answer failed (non-fatal): {e}")
+
         submission_rel = _detect_and_store_submissions(orch, frozen_spec, iter_dir=iter_dir)
 
         try:
@@ -1344,18 +726,116 @@ def improvement_generate_and_execute(
                     tag=part_tag,
                     enforce_validation=True,
                     submission_path=submission_rel,
-                    spec=frozen_spec,
                 )
         except Exception as e:
             print(Fore.YELLOW + f"[IMPROVER] couldn't update metrics/best: {e}")
 
         try:
+            if leaf_id:
+                def _extract_traceback_info(stderr: str) -> Tuple[Optional[str], Optional[str]]:
+                    if not stderr:
+                        return None, None
+
+                    lines = stderr.splitlines()
+
+                    # Regex: matches a bare Python exception type line with optional ": message"
+                    exc_re = re.compile(
+                        r'^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Interrupt|Exit|StopIteration))'
+                        r'(?::\s*(.*))?$'
+                    )
+
+                    # Walk backwards to find the last line that looks like a terminal exception
+                    for line in reversed(lines):
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        m = exc_re.match(stripped)
+                        if m:
+                            exc_type = m.group(1)
+                            exc_msg = (m.group(2) or "").strip() or None
+                            return exc_type, exc_msg
+
+                    return "Could not identify error.", "Could not identify error message."
+
+                combined = (last_stdout or "") + "\n" + (last_errors or "")
+                error_type, error_message = _extract_traceback_info(combined)
+
+                attempts_hist = []
+                try:
+                    attempts_hist = (orch.state_get(incident_node_id) or {}).get("attempts", []) or []
+                except Exception:
+                    attempts_hist = []
+                last_attempt = attempts_hist[-1] if attempts_hist else {}
+                action = last_attempt.get("route")
+                action_described = {
+                    "install": "Attempted to install packages with pip.",
+                    "bash": "Ran a bash command.",
+                    "coding": "Updated the code.",
+                    "lead": "Consulted Lead Agent for suggestions.",
+                    "spec_update": "Updated spec.json.",
+                }
+                last_action = action_described.get(action, "Unknown action.")
+
+                if last_exit_code == 124:
+                    orch.tree_update_insight(leaf_id, {
+                        "status": "timed_out",
+                        "exit_code": last_exit_code,
+                        "bottleneck_diagnosed": f"Code execution timed out after {last_time_strict}s (predicted {last_time_prediction}s; absolute strict timeout was enforced).",
+                        "last_action": last_action,
+                        "code_run_count": code_exec_tries,
+                        "last_error_type": error_type,
+                        "last_error_message": error_message,
+                        "last_code_runtime": last_actual_time,
+                        "last_predicted_time": last_time_prediction
+                    })
+                elif retry > orch.cfg.runtime.router_retry_limit:
+                    last_triage = next(
+                        (a for a in reversed(attempts_hist) if a.get("phase") == "triage"), None
+                    )
+                    bottleneck = (last_triage or {}).get("reason", "cause unavailable")
+                    orch.tree_update_insight(leaf_id, {
+                        "status": "failed_exhausted",
+                        "exit_code": last_exit_code,
+                        "bottleneck_diagnosed": f"Code execution failed. Triage attempted fixes but reached the retry limit. Cause: {bottleneck}",
+                        "last_action": last_action,
+                        "code_run_count": code_exec_tries,
+                        "last_error_type": error_type,
+                        "last_error_message": error_message,
+                        "last_code_runtime": last_actual_time,
+                        "last_predicted_time": last_time_prediction
+                    })
+                elif last_exit_code != 0:
+                    orch.tree_update_insight(leaf_id, {
+                        "status": "failed_no_retry",
+                        "exit_code": last_exit_code,
+                        "bottleneck_diagnosed": f"Code execution failed with exit code {last_exit_code}. Triage did not attempt a fix.",
+                        "last_action": last_action,
+                        "code_run_count": code_exec_tries,
+                        "last_error_type": error_type,
+                        "last_error_message": error_message,
+                        "last_code_runtime": last_actual_time,
+                        "last_predicted_time": last_time_prediction
+                    })
+                else:
+                    orch.tree_update_insight(leaf_id, {
+                        "status": "succeeded",
+                        "exit_code": last_exit_code,
+                        "bottleneck_diagnosed": None,
+                        "last_action": last_action,
+                        "code_run_count": code_exec_tries,
+                        "last_error_type": None,
+                        "last_error_message": None,
+                        "last_code_runtime": last_actual_time,
+                        "last_predicted_time": last_time_prediction
+                    })
+        except Exception:
+            pass
+        try:
             orch.tree_finish(leaf_id, status="done", meta={
                 "iter_idx": iter_idx,
                 "task_idx": task_idx,
                 "metrics": metrics or {},
-                "script": scr_rel,
-                "artifact_summary": art_summary
+                "script": scr_rel
             })
         except Exception:
             pass
@@ -1400,13 +880,13 @@ def _dedupe_improve_plan_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def _improve_level1_prerun_context(
-    task: str,
-    previous_answers: str,
-    summary_lines: List[str],
-    cur_best: Dict[str, Any],
-    frozen_spec: Dict[str, Any],
-    iter_i: int,
-    iters: int,
+        task: str,
+        previous_answers: str,
+        summary_lines: List[str],
+        cur_best: Dict[str, Any],
+        frozen_spec: Dict[str, Any],
+        iter_i: int,
+        iters: int,
 ) -> str:
     """
     Rich context for top-level (depth==0) replanning before the first task of an improver iteration runs.
@@ -1435,109 +915,6 @@ def _improve_level1_prerun_context(
     return "\n\n".join(parts)
 
 
-def _collect_main_pipeline_artifacts(orch: GlobalOrchestrator, spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Read all .md + key .json artifacts from main pipeline for improver context."""
-    art_dir = Path(orch.project_root) / orch.cfg.paths.artifacts_dir
-    artifacts: Dict[str, Any] = {}
-
-    # Read all .md files from artifacts dir
-    try:
-        for md_file in art_dir.glob("*.md"):
-            try:
-                content = md_file.read_text(encoding="utf-8", errors="ignore")
-                artifacts[md_file.name] = content[:4000]
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Read best metrics
-    for mp in (art_dir / "best" / "metrics.json", art_dir / "last" / "metrics.json"):
-        try:
-            if mp.exists():
-                artifacts["best_metrics"] = json.loads(mp.read_text(encoding="utf-8"))
-                break
-        except Exception:
-            pass
-
-    # Read best code
-    for cp in (art_dir / "best" / "code.py", art_dir / "last" / "code.py"):
-        try:
-            if cp.exists():
-                artifacts["best_code"] = cp.read_text(encoding="utf-8")[:8000]
-                break
-        except Exception:
-            pass
-
-    # Data schema from spec
-    csv_summaries = (spec.get("data") or {}).get("meta", {}).get("csv_summaries", {})
-    if isinstance(csv_summaries, dict) and csv_summaries:
-        artifacts["data_schema"] = {
-            name: {"columns": info.get("columns", []), "dtypes": info.get("dtypes", {})}
-            for name, info in csv_summaries.items()
-            if isinstance(info, dict)
-        }
-
-    # Version history (score progression)
-    versions_dir = art_dir / "versions"
-    try:
-        if versions_dir.exists():
-            scores = []
-            for vdir in sorted(versions_dir.iterdir()):
-                if vdir.is_dir():
-                    vm = vdir / "metrics.json"
-                    if vm.exists():
-                        try:
-                            vdata = json.loads(vm.read_text(encoding="utf-8"))
-                            scores.append({"version": vdir.name, "primary": vdata.get("primary")})
-                        except Exception:
-                            pass
-            if scores:
-                artifacts["version_history"] = scores[-10:]
-    except Exception:
-        pass
-
-    return artifacts
-
-
-def _collect_and_enrich_artifacts(
-    orch: GlobalOrchestrator,
-    spec: Dict[str, Any],
-    llm_strong,
-    task: str,
-    previous_iteration_context: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    """
-    Two-phase artifact collection:
-    1. Basic scan via _collect_main_pipeline_artifacts (fast, no LLM)
-    2. ReAct agent deep analysis (reads files itself, 5 iterations, Kaggle Master level)
-    Returns merged enriched artifacts dict.
-    """
-    # Phase 1: basic scan
-    initial_scan = _collect_main_pipeline_artifacts(orch, spec)
-    print(Fore.CYAN + f"[ARTIFACTS] Basic scan: {len(initial_scan)} artifacts collected")
-
-    # Phase 2: ReAct deep analysis
-    try:
-        enriched = react_artifacts_collector_agent(
-            llm_strong,
-            orch,
-            initial_scan=initial_scan,
-            spec=spec,
-            task=task,
-            previous_iteration_context=previous_iteration_context,
-            max_steps=5,
-        )
-        if enriched and isinstance(enriched, dict):
-            _extra_keys = [k for k in enriched if k not in initial_scan]
-            print(Fore.CYAN + f"[ARTIFACTS] ReAct enrichment added {len(_extra_keys)} new keys: {_extra_keys[:5]}")
-            return enriched
-    except Exception as e:
-        print(Fore.YELLOW + f"[ARTIFACTS] ReAct enrichment failed ({e}), using basic scan")
-
-    return initial_scan
-
-
 def improvement_pipeline(
         orch: GlobalOrchestrator,
         llm_strong,
@@ -1552,35 +929,10 @@ def improvement_pipeline(
         max_iters_override: int | None = None,
         mcp_tools: Optional[List[Any]] = None,
         depth: int = 0,
-        improve_start_time: float | None = None,
-        main_pipeline_artifacts: Dict[str, Any] | None = None,
+        improve_start_time: float | None = None
 ) -> tuple[str, Dict[str, Any]]:
     if improve_start_time is None:
         improve_start_time = time.time()
-
-    # Normalize spec to JSON-safe primitives so improver paths do not crash on Path-like values.
-    try:
-        spec = _json_roundtrip_safe(spec or {})
-    except Exception:
-        spec = {}
-
-    # Build modality-aware artifacts index (images/audio/text/tabular/pickle probes)
-    try:
-        _idx_ref = write_artifacts_index(orch)
-        _idx: Dict[str, Any] = {}
-        if isinstance(_idx_ref, dict):
-            _idx = _idx_ref
-        elif isinstance(_idx_ref, Path) and _idx_ref.exists():
-            try:
-                _idx = json.loads(_idx_ref.read_text(encoding="utf-8"))
-            except Exception:
-                _idx = {}
-        if main_pipeline_artifacts is None:
-            main_pipeline_artifacts = {}
-        main_pipeline_artifacts["artifacts_index"] = _idx
-        print(Fore.CYAN + f"[IMPROVER] artifacts_index written ({len(_idx.get('files', {}))} files indexed)")
-    except Exception as _e:
-        print(Fore.YELLOW + f"[IMPROVER] write_artifacts_index failed: {_e}")
 
     # FIX: Use direct attribute access instead of .get() for dataclass
     improve_budget = float(orch.cfg.orchestration.improve_budget_sec)
@@ -1593,7 +945,8 @@ def improvement_pipeline(
     # At or beyond configured depth: no deeper nested improve nodes (prevents runaway trees).
     force_leaf_only = depth >= max_depth
     if force_leaf_only:
-        print(Fore.YELLOW + f"[IMPROVER] Depth {depth} >= max_tree_depth {max_depth}. Nested improves disabled (leaf-only).")
+        print(
+            Fore.YELLOW + f"[IMPROVER] Depth {depth} >= max_tree_depth {max_depth}. Nested improves disabled (leaf-only).")
 
     if resume and not node_id:
         next_id = orch.tree_pick_next_node(prefer_kind="improve")
@@ -1616,16 +969,9 @@ def improvement_pipeline(
         if max_iters_override is not None:
             iters = int(max(1, max_iters_override))
 
-        frozen_spec = _json_roundtrip_safe(spec)
+        frozen_spec = json.loads(json.dumps(spec, ensure_ascii=False))
         improve_root = Path(orch.project_root) / orch.cfg.paths.artifacts_dir / "improve"
         _ensure_dir(improve_root)
-
-        # Inject main pipeline's best code into code_bank for improver context
-        if main_pipeline_artifacts and main_pipeline_artifacts.get("best_code"):
-            best_code = main_pipeline_artifacts["best_code"]
-            if best_code.strip():
-                code_bank.insert(0, best_code)
-                print(Fore.CYAN + f"[IMPROVER] Injected main pipeline best code ({len(best_code)} chars) into code_bank")
 
         try:
             orch.write_file(str(improve_root / "spec_frozen.json"),
@@ -1653,6 +999,9 @@ def improvement_pipeline(
             cur_best = {}
 
         summary_lines.append(f"[IMPROVER] start: iters={iters}, rel_thr={rel_thr}")
+
+        _stall_count = 0  # consecutive iterations without improvement
+        _seen_scores: list[Any] = []  # track primary scores to detect convergence
 
         verifier = FormalVerifier(llm=llm_fast)
         safety_spec = VerificationSpec(
@@ -1813,38 +1162,14 @@ def improvement_pipeline(
 
                     recent_tail = shorten_string_middle("\n".join(summary_lines[-8:]) or "", 6000)
                     graph_hint = shorten_string_middle(orch.format_task_graph_to_string(), 3500)
-
-                    # Build rich artifacts_hint with actual .md content from main pipeline
-                    md_content_block = ""
-                    if main_pipeline_artifacts:
-                        for fname, content in main_pipeline_artifacts.items():
-                            if isinstance(content, str) and fname.endswith(".md"):
-                                md_content_block += f"\n--- {fname} ---\n{content[:2000]}\n"
-                        if main_pipeline_artifacts.get("data_schema"):
-                            md_content_block += f"\n--- data_schema ---\n{json.dumps(main_pipeline_artifacts['data_schema'], ensure_ascii=False)[:2000]}\n"
-                        if main_pipeline_artifacts.get("version_history"):
-                            md_content_block += f"\n--- version_history ---\n{json.dumps(main_pipeline_artifacts['version_history'], ensure_ascii=False)[:1500]}\n"
-                        if main_pipeline_artifacts.get("best_metrics"):
-                            md_content_block += f"\n--- best_metrics ---\n{json.dumps(main_pipeline_artifacts['best_metrics'], ensure_ascii=False)[:1000]}\n"
-                        if main_pipeline_artifacts.get("artifacts_index"):
-                            _idx = main_pipeline_artifacts["artifacts_index"]
-                            # Compact: file names + per-file kind/shape/columns/class_counts
-                            _idx_files = _idx.get("files", {}) if isinstance(_idx, dict) else {}
-                            md_content_block += f"\n--- artifacts_index ({len(_idx_files)} files) ---\n{json.dumps(_idx_files, ensure_ascii=False)[:3500]}\n"
-
                     artifacts_hint = (
                         f"Project root: {orch.project_root}\n"
                         f"Artifacts dir: {art_dir}\n"
-                        f"Prefer reading (if exists): {art_dir/'aggregate_summary.md'}, "
-                        f"{art_dir/'versions'/'ledger.md'}, {art_dir/'final'/'submission_validation.json'}, "
-                        f"{art_dir/'improve'/'pipeline_resume.json'}, and the latest improve/iter_* metrics.\n"
-                        f"\nMAIN PIPELINE ARTIFACTS CONTENT:\n{md_content_block}\n"
+                        f"Prefer reading (if exists): {art_dir / 'aggregate_summary.md'}, "
+                        f"{art_dir / 'versions' / 'ledger.md'}, {art_dir / 'final' / 'submission_validation.json'}, "
+                        f"{art_dir / 'improve' / 'pipeline_resume.json'}, and the latest improve/iter_* metrics.\n"
                     )
 
-                    # Knowledge Curator BEFORE: tailored context for the improver meta-planner.
-                    _cur_mp_ctx = _curator_before(orch, llm_fast, llm_strong, role="meta_planner", task_hint=task or "")
-                    if _cur_mp_ctx:
-                        artifacts_hint = (artifacts_hint or "") + "\n" + _cur_mp_ctx
                     for meta_try in range(meta_attempts):
                         meta_obj = react_improver_meta_planner_agent(
                             llm_strong,
@@ -1852,7 +1177,8 @@ def improvement_pipeline(
                             task=task,
                             spec=frozen_spec,
                             metrics_summary=cur_best or {},
-                            recent_summaries=recent_tail + ("\n\nTechnical review:\n" + shorten_string_middle(review_doc, 3500)),
+                            recent_summaries=recent_tail + (
+                                        "\n\nTechnical review:\n" + shorten_string_middle(review_doc, 3500)),
                             depth=depth,
                             max_depth=max_depth,
                             remaining_improve_sec=meta_budget_sec,
@@ -1877,7 +1203,8 @@ def improvement_pipeline(
                                 if isinstance(acs, list) and acs:
                                     short_acs = [str(x).strip() for x in acs[:3] if str(x).strip()]
                                     if short_acs:
-                                        ttxt = ttxt + "\nAcceptance checks:\n" + "\n".join([f"- {x}" for x in short_acs])
+                                        ttxt = ttxt + "\nAcceptance checks:\n" + "\n".join(
+                                            [f"- {x}" for x in short_acs])
                                 deep_raw.append(
                                     {
                                         "task": ttxt,
@@ -1891,7 +1218,8 @@ def improvement_pipeline(
                             continue
 
                         task_strs = [t["task"] for t in normalized]
-                        print(Fore.CYAN + f"[META-PLANNER] Verifying safety for meta deep plan (try {meta_try + 1}/{meta_attempts})...")
+                        print(
+                            Fore.CYAN + f"[META-PLANNER] Verifying safety for meta deep plan (try {meta_try + 1}/{meta_attempts})...")
                         ver_result = verifier.verify_plan(
                             task_strs,
                             safety_spec,
@@ -1999,8 +1327,10 @@ def improvement_pipeline(
                                                                kinds=kinds)
                 try:
                     for idx_c, cid_c in enumerate(child_ids):
-                        tb = ordered_tasks[idx_c].get("time_budget_sec", default_tb) if idx_c < len(ordered_tasks) else default_tb
+                        tb = ordered_tasks[idx_c].get("time_budget_sec", default_tb) if idx_c < len(
+                            ordered_tasks) else default_tb
                         orch.tree_update_meta(cid_c, {"time_budget_sec": int(tb)})
+                        orch.tree_update_insight(cid_c, {"allocated_time_total": int(tb)})
                 except Exception:
                     pass
 
@@ -2023,7 +1353,8 @@ def improvement_pipeline(
             while j < len(ordered_tasks):
                 rem_improve = improve_budget - (time.time() - improve_start_time)
                 if rem_improve <= 0:
-                    print(Fore.YELLOW + "[IMPROVER] improve_budget_sec exhausted; stopping remaining tasks in this iteration.")
+                    print(
+                        Fore.YELLOW + "[IMPROVER] improve_budget_sec exhausted; stopping remaining tasks in this iteration.")
                     summary_lines.append(
                         f"[IMPROVER] Time budget hit before task {j + 1}/{len(ordered_tasks)} (iter {i})."
                     )
@@ -2045,10 +1376,10 @@ def improvement_pipeline(
                 # iteration (full queue + goal + metric + prior conclusions). Deeper nests keep tail-only replan.
                 _rem_for_replan = improve_budget - (time.time() - improve_start_time)
                 replan_pre_first = (
-                    depth == 0
-                    and j == 0
-                    and len(ordered_tasks) > 1
-                    and _rem_for_replan >= 180
+                        depth == 0
+                        and j == 0
+                        and len(ordered_tasks) > 1
+                        and _rem_for_replan >= 180
                 )
                 replan_after_progress = j > 0
                 if replan_pre_first or replan_after_progress:
@@ -2079,19 +1410,15 @@ def improvement_pipeline(
                     if isinstance(prev_head, dict) and prev_head.get("improver_head"):
                         try:
                             head_recent = (
-                                head_recent
-                                + "\n\nPREV_DECISION_MEMORY (last head):\n"
-                                + json.dumps(prev_head.get("improver_head"), ensure_ascii=False)[:2500]
+                                    head_recent
+                                    + "\n\nPREV_DECISION_MEMORY (last head):\n"
+                                    + json.dumps(prev_head.get("improver_head"), ensure_ascii=False)[:2500]
                             )
                         except Exception:
                             pass
 
                     current_improve_remaining = improve_budget - (time.time() - improve_start_time)
                     graph_hint = shorten_string_middle(orch.format_task_graph_to_string(), 3500)
-                    # Knowledge Curator BEFORE: supply role-tailored brief for the improver head.
-                    _cur_ih_ctx = _curator_before(orch, llm_fast, llm_strong, role="improver_head", task_hint=task or "")
-                    if _cur_ih_ctx:
-                        head_recent = head_recent + "\n\n" + _cur_ih_ctx
                     head = improver_head_agent(
                         llm_fast,
                         task=task,
@@ -2102,7 +1429,6 @@ def improvement_pipeline(
                         max_depth=max_depth,
                         remaining_improve_sec=max(0, int(current_improve_remaining)),
                         graph_hint=graph_hint,
-                        main_pipeline_artifacts=main_pipeline_artifacts,
                     )
                     hn = (
                         f"verdict={head.get('verdict')} stuck={head.get('stuck')} trend={head.get('metric_trend')}\n"
@@ -2133,26 +1459,20 @@ def improvement_pipeline(
                     _log_body = completed_summary
                     if pre_run:
                         _log_body = (
-                            "[MODE=LEVEL1_PRE_ITERATION_REPLAN]\n"
-                            "Full queue in REMAINING_TASKS; none started this iteration.\n"
-                            "Reorder/merge for sequential experiments; stay within HARD_CAP.\n\n"
-                            + completed_summary
+                                "[MODE=LEVEL1_PRE_ITERATION_REPLAN]\n"
+                                "Full queue in REMAINING_TASKS; none started this iteration.\n"
+                                "Reorder/merge for sequential experiments; stay within HARD_CAP.\n\n"
+                                + completed_summary
                         )
                     _log_cap = 4500 if pre_run else 2000
-                    # Knowledge Curator BEFORE: inject canonical lessons/pruned for improvement replanner.
-                    _cur_ir_ctx = _curator_before(orch, llm_fast, llm_strong, role="replanner", task_hint=task or "")
-                    _log_body_final = shorten_string_middle(_log_body, _log_cap)
-                    if _cur_ir_ctx:
-                        _log_body_final = _log_body_final + "\n\n" + _cur_ir_ctx
                     replan_res = improvement_replanning_agent(
                         llm_strong, task,
-                        _log_body_final,
+                        shorten_string_middle(_log_body, _log_cap),
                         remaining,
                         depth=i, max_depth=iters,
                         remaining_time=int(current_improve_remaining),
                         head_notes=hn,
                         max_tail_tasks=_im_tail_cap,
-                        extra_budget_sec=int(spec.get("_extra_budget_sec", 0)) if spec else 0,
                     )
                     if str(head.get("verdict", "")).lower() == "finalize":
                         replan_final = [{
@@ -2200,7 +1520,8 @@ def improvement_pipeline(
                                 for old_cid in old_cids_to_abandon:
                                     if orch.tree_node_status(old_cid) not in ("done", "failed"):
                                         task_text = str(orch.tree_node(old_cid).get("task", ""))
-                                        f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] IMPROVER PRUNED: {task_text}\n")
+                                        f.write(
+                                            f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] IMPROVER PRUNED: {task_text}\n")
                                         orch.tree_log_event(
                                             "PRUNED",
                                             task_text,
@@ -2324,47 +1645,31 @@ def improvement_pipeline(
             except Exception:
                 new_best = {}
 
-            improved = _rel_better(new_best, cur_best, rel_thr=rel_thr)
-            if improved:
+            if _rel_better(new_best, cur_best, rel_thr=rel_thr):
                 summary_lines.append(
                     f"[IMPROVER] iter {i:02d}: improved {cur_best.get('primary')} -> {new_best.get('primary')}")
                 cur_best = new_best or cur_best
+                _stall_count = 0
             else:
                 summary_lines.append(
                     f"[IMPROVER] iter {i:02d}: no relative improvement (kept {cur_best.get('primary')}, got {new_best.get('primary')})")
+                _stall_count += 1
 
-            # Build inter-iteration context for next iteration's ReAct artifacts collector
-            prev_ctx = spec.get("_inter_iteration_context") or {"what_worked": [], "what_failed": [], "next_to_try": [], "key_insights": []}
-            iter_tasks_desc = [t.get("task", "") if isinstance(t, dict) else str(t) for t in ordered_tasks[:5]]
-            if improved:
-                prev_ctx["what_worked"].append(f"iter {i}: {iter_tasks_desc} -> improved to {new_best.get('primary')}")
-            else:
-                prev_ctx["what_failed"].append(f"iter {i}: {iter_tasks_desc} -> no improvement (got {new_best.get('primary')})")
-            # Carry forward improvement suggestions from ReAct collector if available
-            if main_pipeline_artifacts and main_pipeline_artifacts.get("improvement_suggestions"):
-                suggs = main_pipeline_artifacts["improvement_suggestions"]
-                prev_ctx["next_to_try"] = [s.get("idea", "") for s in suggs[:5] if isinstance(s, dict)]
-            if main_pipeline_artifacts and main_pipeline_artifacts.get("inter_iteration_context"):
-                ric = main_pipeline_artifacts["inter_iteration_context"]
-                if isinstance(ric, dict):
-                    for k in ("key_insights",):
-                        if k in ric and isinstance(ric[k], list):
-                            prev_ctx[k] = (prev_ctx.get(k) or []) + ric[k]
-                            prev_ctx[k] = prev_ctx[k][-10:]  # keep last 10
-            spec["_inter_iteration_context"] = prev_ctx
-
-            # Re-enrich artifacts for next iteration with updated context
-            if i < iters:
-                try:
-                    main_pipeline_artifacts = _collect_and_enrich_artifacts(
-                        orch, spec, llm_strong, task,
-                        previous_iteration_context=prev_ctx,
-                    )
-                    if main_pipeline_artifacts:
-                        spec["_main_pipeline_artifacts"] = main_pipeline_artifacts
-                        print(Fore.CYAN + f"[IMPROVER] Re-enriched artifacts for iter {i+1} with inter-iteration context")
-                except Exception as e:
-                    print(Fore.YELLOW + f"[IMPROVER] Re-enrichment failed: {e}")
+            # Diversity guard: if score is stuck, force a different approach next iteration.
+            _cur_primary = (new_best or cur_best).get("primary")
+            _score_repeated = _cur_primary is not None and _seen_scores.count(_cur_primary) >= 2
+            if _stall_count >= 2 or _score_repeated:
+                _guard_msg = (
+                    f"[DIVERSITY_GUARD] Score has not improved for {_stall_count} consecutive iteration(s) "
+                    f"(score={_cur_primary}). "
+                    "You MUST try a fundamentally different approach in the next iteration: "
+                    "different model architecture, different feature engineering, different validation strategy, "
+                    "or different hyperparameter range. Do NOT repeat the same code or minor variants of it."
+                )
+                summary_lines.append(_guard_msg)
+                print(Fore.RED + _guard_msg)
+            if _cur_primary is not None:
+                _seen_scores.append(_cur_primary)
 
         try:
             if hasattr(orch, "tree_update_meta"):
@@ -2435,9 +1740,7 @@ def _build_artifacts_snapshot(orch: GlobalOrchestrator, *, max_checkpoints: int 
         except ValueError:
             rels.append(p.name)
     metric_hints: List[str] = []
-    # Canonical order: best/metrics.json is authoritative; last/metrics.json is fallback.
-    # best_metrics.json is a secondary optimizer-only write — check last so it doesn't shadow canonical.
-    for rel in ("best/metrics.json", "last/metrics.json", "best_metrics.json", "metrics.json"):
+    for rel in ("metrics.json", "best_metrics.json", "best/metrics.json"):
         mp = art / rel
         if not mp.is_file():
             continue
@@ -2451,27 +1754,15 @@ def _build_artifacts_snapshot(orch: GlobalOrchestrator, *, max_checkpoints: int 
                 metric_hints.append(f"  {rel}: (non-dict json)")
         except Exception:
             metric_hints.append(f"  {rel}: (unreadable)")
-    # Key canonical artifact paths for agent orientation (existence-checked)
-    canon_hints: List[str] = []
-    for rel in ("best/code.py", "last/code.py", "best/submission.csv"):
-        if (art / rel).is_file():
-            canon_hints.append(f"  artifacts/{rel}")
-    if not rels and not metric_hints and not canon_hints:
+    if not rels and not metric_hints:
         return ""
-    lines = [
-        "ARTIFACTS_SNAPSHOT (reuse checkpoints when sub-task allows; respect pretrained rules):",
-        "  Canonical paths: artifacts/best/metrics.json, artifacts/last/metrics.json, "
-        "artifacts/best/code.py, artifacts/last/code.py — see task_plan.md §2.4 for full existence table.",
-    ]
+    lines = ["ARTIFACTS_SNAPSHOT (reuse checkpoints when sub-task allows; respect pretrained rules):"]
     if rels:
         lines.append("Checkpoints / model files (most recent first):")
         lines.extend(f"  - {r}" for r in rels)
     if metric_hints:
-        lines.append("Metric files (first = best available):")
+        lines.append("Metric files:")
         lines.extend(metric_hints)
-    if canon_hints:
-        lines.append("Canonical code/submission artifacts present:")
-        lines.extend(canon_hints)
     return "\n".join(lines) + "\n\n"
 
 
@@ -2502,25 +1793,8 @@ def generate_code_and_execute(
     spec.setdefault("submission", {"columns": []})
 
     verifier = FormalVerifier(llm=llm_fast)
-    incident_node_id = str(leaf_id) if leaf_id else f"adhoc_{hashlib.md5((task or '').encode('utf-8')).hexdigest()[:10]}"
-
-    # Modality-aware schema cheat-sheet + artifact-introspection tools for the coder
-    try:
-        _schema_snapshot = build_schema_snapshot(orch, spec) or ""
-    except Exception as _e:
-        print(Fore.YELLOW + f"[SCHEMA] build_schema_snapshot failed: {_e}")
-        _schema_snapshot = ""
-    try:
-        _artifact_tools = build_structured_artifact_tools(orch) or []
-    except Exception as _e:
-        print(Fore.YELLOW + f"[TOOLS] build_structured_artifact_tools failed: {_e}")
-        _artifact_tools = []
-    if mcp_tools is None:
-        mcp_tools = []
-    _existing_names = {getattr(t, "name", "") for t in mcp_tools}
-    for _t in _artifact_tools:
-        if getattr(_t, "name", "") not in _existing_names:
-            mcp_tools.append(_t)
+    incident_node_id = str(
+        leaf_id) if leaf_id else f"adhoc_{hashlib.md5((task or '').encode('utf-8')).hexdigest()[:10]}"
 
     # Load project context if it exists
     project_context = ""
@@ -2561,12 +1835,11 @@ def generate_code_and_execute(
 
     improve_guidelines = (
         "IMPROVE_MODE\n"
-        "- MONOLITH PREFERENCE: Prefer a single robust script for end-to-end logic. Avoid split dependencies unless logic is extremely complex.\n"
-        "- ARTIFACT AWARENESS: Read `project_context.md` to identify actual column names and pkl/dict structures. Never guess paths or keys.\n"
-        "- Do NOT rebuild from scratch if existing code already handles data loading/validation correctly.\n"
-        "- Obey `spec.constraints` (no internet, no external weights if forbidden).\n"
-        "- Print `METRICS_JSON` with `primary` metric matching `spec`.\n"
+        "- Do NOT rebuild from scratch. Start from existing code/artifacts.\n"
         "- Keep data paths STRICTLY from spec.data.*; DO NOT change I/O, filenames, or submission schema.\n"
+        "- Keep validation **consistent** with the run you improve on; if you change split depth (e.g. fewer folds to save time), document in stdout and do not break group/time rules.\n"
+        "- Keep model stack; prefer SMALL, TARGETED changes (hyperparams, features, thresholds, tokenization, LR, epochs).\n"
+        "- Do NOT delete/rename artifacts; do NOT drop sample submissions; keep submission columns = spec.submission.columns.\n"
     )
 
     remaining_time = getattr(
@@ -2583,38 +1856,41 @@ def generate_code_and_execute(
     context_prefix += project_context  # Add project context to all prompts
     if artifacts_snapshot:
         context_prefix += artifacts_snapshot
-    # Knowledge Curator: synchronous BEFORE supervisor — routes role-tailored MD context to coder.
-    _curator_ctx = _curator_before(orch, llm_fast, code_llm, role="coder", task_hint=task or "")
-    if _curator_ctx:
-        context_prefix += "\n" + _curator_ctx + "\n"
 
     answer_code = ""
     max_gen_retries = 8
 
+    # Generate a static check description once, reuse across retries.
+    _static_check_desc = ""
+    try:
+        _static_check_desc = checks_generation(llm_fast, task, spec)
+    except Exception:
+        pass
+
     for attempt in range(max_gen_retries):
-        remaining_time = getattr(orch, "global_deadline_sec", orch.cfg.orchestration.total_budget_sec) - orch.effective_elapsed_sec()
-        if remaining_time <= 0:
-            raise TimeoutError("HARD DEADLINE EXCEEDED during code generation retries.")
-        print(Fore.BLUE + f"GENERATING CODE (Attempt {attempt + 1}/{max_gen_retries}) | TIME LEFT: {int(remaining_time)}s")
-        try:
-            answer_code = perform_task_python_v2(
-                code_llm,
-                task,
-                spec,
-                previous_code=code_bank[-1] if code_bank else "",
-                context=context_prefix + previous_answers,
-                tools=mcp_tools,
-                orch=orch,
-                schema_snapshot=_schema_snapshot,
-            )
-        except Exception as _llm_err:
-            print(Fore.RED + f"[CODE_GEN] LLM call failed after retries: {type(_llm_err).__name__}: {_llm_err}")
-            if attempt < max_gen_retries - 1:
-                previous_answers += f"\n[LLM_ERROR] Provider returned: {type(_llm_err).__name__}. Retrying with fresh attempt."
-                continue
-            answer_code = code_bank[-1] if code_bank else ""
+        print(
+            Fore.BLUE + f"GENERATING CODE (Attempt {attempt + 1}/{max_gen_retries}) | TIME LEFT: {int(remaining_time)}s")
+        answer_code = perform_task_python_v2(
+            code_llm,
+            task,
+            spec,
+            previous_code=code_bank[-1] if code_bank else "",
+            context=context_prefix + previous_answers
+            , tools=mcp_tools)
 
         clean_code = answer_code.replace("```python", "").replace("```", "").strip()
+
+        # Fast LLM pre-check: catch obvious structural issues before executing code.
+        # Avoids wasting execution time on code that already looks wrong statically.
+        if _static_check_desc and clean_code:
+            try:
+                passed = check_answer(llm_fast, task, clean_code, _static_check_desc, spec)
+                if passed == "False":
+                    print(Fore.YELLOW + f"[PRE_CHECK] Static check failed. Regenerating code.")
+                    previous_answers += f"\n[PRE_CHECK_FAIL] Code failed static check: {_static_check_desc}. Fix before submitting."
+                    continue
+            except Exception:
+                pass
 
         print(Fore.CYAN + "[VERIFIER] Auditing code safety...")
         safety_check = verifier.verify_code_safety(clean_code, spec)
@@ -2634,159 +1910,100 @@ def generate_code_and_execute(
 
     is_ok = False
     last_stdout, last_errors = "", ""
+    last_exit_code = 0
+    last_time_prediction = 0
+    last_actual_time = 0
     retry_count = 0
     metrics: Dict[str, Any] = {}
-    spec_update_consecutive_count = 0  # Guard against spec_update-only loops
-    # Initialize heuristic_ok so the post-loop metric-verification block doesn't
-    # crash with UnboundLocalError when the while-loop exits via a cap break
-    # before any code execution actually ran (e.g. every attempt blocked by preflight).
-    heuristic_ok = False
 
     # Hard cap: prevents infinite "triage-only" loops when the model keeps failing.
     triage_iter_count = 0
     max_triaeg_iters = int(getattr(orch.cfg.runtime, "generation_retry_limit", 20))
     max_triaeg_iters = max(3, max_triaeg_iters)
 
-    # Error-signature deduplication: track how many times each unique error appears.
-    # If the same error repeats >= 3 times, force lead-agent escalation instead of
-    # routing the triage agent to the same broken fix strategy again.
-    _seen_error_sigs: Dict[str, int] = {}
-
     while not is_ok:
-        preflight = react_preexec_auditor_agent(
+        triage_iter_count += 1
+        if triage_iter_count > max_triaeg_iters:
+            print(
+                Fore.RED
+                + f"[TRIAGE] Hard cap reached ({triage_iter_count - 1}/{max_triaeg_iters}). Exiting triage loop."
+            )
+            orch.state_append_attempt(incident_node_id, {
+                "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                "phase": "triage_cap",
+                "route": "loop_cap",
+                "reason": f"Exceeded max triage iterations: {max_triaeg_iters}",
+                "stderr_tail": (last_errors or "")[-1000:],
+                "stdout_tail": (last_stdout or "")[-1000:],
+            })
+            break
+
+        print(Fore.BLUE + "RUNNING CODE")
+        if type(answer_code) is list:
+            answer_code = '\n'.join(answer_code)
+
+        # Predict execution time
+        prediction = execution_predictor_agent(llm_fast, answer_code, spec)
+        print(
+            Fore.CYAN + f"[MONITOR] Predicted time: {prediction.get('expected_time_sec')}s, Intensity: {prediction.get('resource_intensity')}")
+        last_time_prediction = prediction.get('expected_time_sec')
+
+        start = datetime.datetime.now(datetime.UTC)
+        result = orch.code_executor(
+            answer_code.replace("```", "").replace("python", ""),
+            spec=spec,
+            prediction=prediction
+        )
+        end = datetime.datetime.now(datetime.UTC)
+        last_actual_time = (end - start).total_seconds()
+
+        print(Fore.BLUE + "FINISHED RUNNING CODE")
+
+        last_stdout, last_errors = result["output"], result["errors"]
+        last_exit_code = result["exit_code"]
+        heuristic_ok = (result["errors"] == "" and len(result["output"]) > 2) or (
+                "error" not in result["errors"].lower())
+
+        # Hard rule: if the script explicitly signaled metrics as "skipped",
+        # treat this execution as success for EDA/Load-style tasks.
+        # This prevents triage from endlessly trying to compute metrics that should not exist.
+        metrics_now = parse_metrics_from_stdout(last_stdout) or {}
+        if isinstance(metrics_now, dict) and metrics_now.get("type") == "skipped":
+            metrics = metrics_now
+            is_ok = True
+            orch.state_append_attempt(incident_node_id, {
+                "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                "phase": "run",
+                "result": "ok",
+                "metrics_type": "skipped",
+            })
+            break
+
+        llm_ok = evaluate_run_ok_with_retry(
             llm_fast=llm_fast,
-            orch=orch,
-            task=task,
+            stdout=last_stdout,
+            stderr=last_errors,
             spec=spec,
             code_text=answer_code,
-            context="Main pre-exec audit. Inspect task_plan tree and artifact filesystem before run.",
+            additional_context=(
+                f"METRIC: {spec['primary_metric']['name']} SHOULD BE CALCULATED! + as addition {', '.join(spec['secondary_metrics'])}"
+                if progress > 0.2 else ""
+            ),
         )
-        allow_run = bool(preflight.get("allow_run", True))
-        preflight_issues = [str(x) for x in (preflight.get("issues") or [])]
-        if bool(preflight.get("planning_only", False)):
-            preflight_issues.append("planning_only_task_detected")
 
-        # ── Verify "Missing dependency" claims programmatically ──
-        # The LLM often guesses packages are missing without running import checks.
-        # We verify each claim and remove false positives.
-        if preflight_issues:
-            preflight_issues = _verify_dependency_claims(orch, preflight_issues)
-            if not preflight_issues:
-                allow_run = True
+        is_ok = bool(heuristic_ok and llm_ok)
+        if is_ok:
+            orch.state_append_attempt(incident_node_id, {
+                "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                "phase": "run",
+                "result": "ok",
+                "heuristic_ok": heuristic_ok,
+                "llm_ok": llm_ok,
+            })
+            break
 
-        skipped_execution = False
-        if not allow_run or preflight_issues:
-            print(Fore.YELLOW + f"[PREFLIGHT][AGENT] blocked: {preflight_issues}")
-            last_stdout = ""
-            last_errors = "AGENTIC PRE-EXECUTION AUDIT BLOCKED: " + "; ".join(preflight_issues)
-            if preflight.get("required_fixes"):
-                last_errors += "\nREQUIRED_FIXES: " + str(preflight.get("required_fixes"))
-            skipped_execution = True
-        else:
-            triage_iter_count += 1
-            if triage_iter_count > max_triaeg_iters:
-                print(
-                    Fore.RED
-                    + f"[TRIAGE] Hard cap reached ({triage_iter_count-1}/{max_triaeg_iters}). Exiting triage loop."
-                )
-                orch.state_append_attempt(incident_node_id, {
-                    "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                    "phase": "triage_cap",
-                    "route": "loop_cap",
-                    "reason": f"Exceeded max triage iterations: {max_triaeg_iters}",
-                    "stderr_tail": (last_errors or "")[-1000:],
-                    "stdout_tail": (last_stdout or "")[-1000:],
-                })
-                break
-
-            print(Fore.BLUE + "RUNNING CODE")
-            if type(answer_code) is list:
-                answer_code = '\n'.join(answer_code)
-
-            # Predict execution time
-            prediction = execution_predictor_agent(llm_fast, answer_code, spec)
-            print(
-                Fore.CYAN + f"[MONITOR] Predicted time: {prediction.get('expected_time_sec')}s, Intensity: {prediction.get('resource_intensity')}")
-
-            result = orch.code_executor(
-                answer_code.replace("```", "").replace("python", ""),
-                spec=spec,
-                prediction=prediction
-            )
-            print(Fore.BLUE + "FINISHED RUNNING CODE")
-
-            last_stdout, last_errors = result["output"], result["errors"]
-            heuristic_ok = (result["errors"] == "" and len(result["output"]) > 2) or (
-                    "error" not in result["errors"].lower())
-
-            # Hard rule: if the script explicitly signaled metrics as "skipped",
-            # treat this execution as success for EDA/Load-style tasks.
-            # This prevents triage from endlessly trying to compute metrics that should not exist.
-            metrics_now = parse_metrics_from_stdout(last_stdout) or {}
-            if isinstance(metrics_now, dict) and metrics_now.get("type") == "skipped":
-                metrics = metrics_now
-                is_ok = True
-                orch.state_append_attempt(incident_node_id, {
-                    "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                    "phase": "run",
-                    "result": "ok",
-                    "metrics_type": "skipped",
-                })
-                break
-
-            llm_ok = evaluate_run_ok_with_retry(
-                llm_fast=llm_fast,
-                stdout=last_stdout,
-                stderr=last_errors,
-                spec=spec,
-                code_text=answer_code,
-                additional_context=(
-                    f"METRIC: {spec['primary_metric']['name']} SHOULD BE CALCULATED! + as addition {', '.join(spec['secondary_metrics'])}"
-                    if progress > 0.2 else ""
-                ),
-            )
-
-            is_ok = bool(heuristic_ok and llm_ok)
-            if is_ok:
-                orch.state_append_attempt(incident_node_id, {
-                    "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                    "phase": "run",
-                    "result": "ok",
-                    "heuristic_ok": heuristic_ok,
-                    "llm_ok": llm_ok,
-                })
-                break
-
-        # Triage Phase (Handles both pre-flight blocks and runtime errors)
-        if skipped_execution:
-            # Ensure we count the block as an attempt for cap protection
-            triage_iter_count += 1
-            if triage_iter_count > max_triaeg_iters:
-                print(Fore.RED + f"[PREFLIGHT] Hard cap reached on blocks. Exiting.")
-                break
-
-        # ── Error-signature dedup ──────────────────────────────────────────────
-        # Fingerprint the current error (first 200 chars, stripped). If the exact
-        # same error has appeared 3+ times we are stuck in a loop: force escalation
-        # to the lead agent, which has broader context and can try a different strategy.
-        if last_errors:
-            _err_sig = (last_errors or "").strip()[:200]
-            _seen_error_sigs[_err_sig] = _seen_error_sigs.get(_err_sig, 0) + 1
-            if _seen_error_sigs[_err_sig] >= 3:
-                print(Fore.RED + f"[TRIAGE] Same error seen {_seen_error_sigs[_err_sig]}x — forcing lead escalation to break loop.")
-                plan = router.route(last_errors, last_stdout, spec, answer_code)
-                plan["route"] = "lead"
-                plan["reason"] = (
-                    f"Error repeated {_seen_error_sigs[_err_sig]} times without resolution. "
-                    + plan.get("reason", "")
-                )
-                route = "lead"
-            else:
-                plan = router.route(last_errors, last_stdout, spec, answer_code)
-                route = plan.get("route", "coding")
-        else:
-            plan = router.route(last_errors, last_stdout, spec, answer_code)
-            route = plan.get("route", "coding")
+        plan = router.route(last_errors, last_stdout, spec, answer_code)
+        route = plan.get("route", "coding")
 
         # Let lead incident manager re-route based on accumulated attempts and context.
         attempts_hist = []
@@ -2830,9 +2047,9 @@ def generate_code_and_execute(
         # If we keep routing to coding for too long, refresh spec.data/meta via spec_update.
         attempts_after = len(attempts_hist) + 1
         if (
-            route == "coding"
-            and attempts_after >= orch.cfg.runtime.router_retry_limit
-            and len(attempts_hist) >= 3
+                route == "coding"
+                and attempts_after >= orch.cfg.runtime.router_retry_limit
+                and len(attempts_hist) >= 3
         ):
             recent_routes = [str(a.get("route", "")) for a in attempts_hist[-3:] if isinstance(a, dict)]
             recent_routes.append(route)
@@ -2840,20 +2057,9 @@ def generate_code_and_execute(
                 route = "spec_update"
                 plan["route"] = "spec_update"
                 plan.setdefault("spec_patch", {})
-                plan["reason"] = (plan.get("reason", "") + " | forced spec_update after repeated coding attempts").strip()
+                plan["reason"] = (
+                            plan.get("reason", "") + " | forced spec_update after repeated coding attempts").strip()
                 print(Fore.RED + "[TRIAGE] Forced spec_update to break coding-only loop.")
-
-        # Inverse guardrail: prevent long "spec_update-only" loops.
-        if route == "spec_update":
-            spec_update_consecutive_count += 1
-            if spec_update_consecutive_count >= 3:
-                route = "coding"
-                plan["route"] = "coding"
-                plan["reason"] = (plan.get("reason", "") + " | forced coding after 3 consecutive spec_updates").strip()
-                print(Fore.RED + "[TRIAGE] Forced coding to break spec_update-only loop.")
-                spec_update_consecutive_count = 0
-        else:
-            spec_update_consecutive_count = 0
 
         if route == "install":
             pkgs = plan.get("packages", []) or []
@@ -2870,15 +2076,9 @@ def generate_code_and_execute(
                     "exit_code": install_res.get("exit_code", 1),
                     "stderr_tail": str(install_res.get("stderr", ""))[-1000:],
                 })
-                if install_res.get("exit_code", 1) != 0:
+                if int(install_res.get("exit_code", 1) or 1) != 0:
                     last_errors = f"{install_res.get('stderr', '')}\n{install_res.get('stdout', '')}"
                     print(Fore.RED + "[TRIAGE] install failed; re-triaging based on pip output.")
-                    # Track per-package failures so router can stop retrying hopeless packages.
-                    if hasattr(router, "_install_fail_counts"):
-                        for _pkg in pkgs:
-                            _pk = (_pkg or "").lower().strip()
-                            if _pk:
-                                router._install_fail_counts[_pk] = router._install_fail_counts.get(_pk, 0) + 1
                     retry_count += 1
                     if retry_count > orch.cfg.runtime.router_retry_limit:
                         print(Fore.RED + "[TRIAGE] Retry limit exceeded after install failures.")
@@ -2923,10 +2123,9 @@ def generate_code_and_execute(
                 task,
                 spec,
                 previous_code=code_bank[-1] if code_bank else "",
-                context=(improve_guidelines + "\n" if improve_mode else "") + guidance + "\nPREV_ERROR:\n" + (last_errors or "")[:1200],
+                context=(improve_guidelines + "\n" if improve_mode else "") + guidance + "\nPREV_ERROR:\n" + (
+                            last_errors or "")[:1200],
                 tools=mcp_tools,
-                orch=orch,
-                schema_snapshot=_schema_snapshot,
             )
             continue
 
@@ -2939,56 +2138,10 @@ def generate_code_and_execute(
             )
 
         elif route == "bash":
-            # If the error is about a missing artifact/input file, auto-prepend
-            # inspection commands so the Lead Agent sees the REAL filesystem
-            # state (not just the triage's guess). Observed hallucination
-            # pattern: aggregate_answers claims a file was saved, preflight
-            # blocks on it forever, triage produces `mkdir -p artifacts` which
-            # tells the Lead nothing. Prepend discovery commands to fix.
-            raw_bash_cmds = _sanitize_triage_bash_cmds(plan.get("bash_cmds", []))
-            _err_lower = (last_errors or "").lower()
-            _missing_hint = any(
-                kw in _err_lower
-                for kw in (
-                    "missing required input artifact",
-                    "no such file",
-                    "filenotfounderror",
-                    "file not found",
-                )
-            )
-            if _missing_hint:
-                _is_win = (getattr(orch.bash, "os", "") == "Windows")
-                _art = orch.cfg.paths.artifacts_dir
-                if _is_win:
-                    _discovery = [
-                        f"Get-ChildItem -Force -LiteralPath '{_art}' | Format-Table Mode, Length, Name -AutoSize",
-                        f"Get-ChildItem -Recurse -Filter *.parquet -LiteralPath '.' -ErrorAction SilentlyContinue | Select-Object -First 50 FullName, Length",
-                    ]
-                else:
-                    _discovery = [
-                        f"ls -la {_art}",
-                        "find . -name '*.parquet' -not -path './.*' 2>/dev/null | head -50",
-                    ]
-                # Prepend, avoiding duplicates of exact strings already in raw_bash_cmds.
-                _existing = set(raw_bash_cmds)
-                bash_cmds_final = [c for c in _discovery if c not in _existing] + raw_bash_cmds
-                print(Fore.CYAN + f"[BASH] auto-prepended {len(bash_cmds_final) - len(raw_bash_cmds)} discovery cmd(s) for missing-artifact error")
-            else:
-                bash_cmds_final = raw_bash_cmds
-
             answer_bash = {}
-            bash_transcript: List[str] = []
-            for cmd in bash_cmds_final:
+            for cmd in plan.get("bash_cmds", []):
                 print(Fore.CYAN + f"[BASH] {cmd}")
                 answer_bash = orch.bash.run(cmd, timeout=orch.cfg.runtime.bash_timeout_sec, stream=True)
-                # Accumulate a short transcript so the Lead Agent sees output
-                # from ALL discovery commands, not just the last one.
-                _stdout_chunk = (answer_bash.get("stdout") or "")[:1200]
-                _stderr_chunk = (answer_bash.get("stderr") or "")[:600]
-                bash_transcript.append(
-                    f"$ {cmd}\n{_stdout_chunk}"
-                    + (f"\n[stderr] {_stderr_chunk}" if _stderr_chunk.strip() else "")
-                )
                 orch.state_append_attempt(incident_node_id, {
                     "ts": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                     "phase": "action",
@@ -2998,15 +2151,13 @@ def generate_code_and_execute(
 
             print("1. Consulting Lead Agent for suggestions...")
             current_code = code_bank[-1] if code_bank else ""
-            _bash_blob = "\n\n".join(bash_transcript) if bash_transcript else json.dumps(answer_bash)
             suggestions = lead_agent_propose_changes(
                 llm=code_llm,
                 lead_reason=plan.get('reason', ''),
                 task=task,
                 spec=spec,
                 code=current_code,
-                last_stdout=f"Bash discovery output:\n{_bash_blob}\n\nOriginal execution error:\n{(last_errors or '')[:2000]}",
-                orch=orch,
+                last_stdout=f"Bash agent output: {json.dumps(answer_bash)}"
             )
             print(f"LEAD AGENT SUGGESTIONS:\n{suggestions}")
 
@@ -3032,8 +2183,7 @@ def generate_code_and_execute(
                 task=task,
                 spec=spec,
                 code=current_code,
-                last_stdout=last_stdout,
-                orch=orch,
+                last_stdout=last_stdout
             )
             print(f"LEAD AGENT SUGGESTIONS:\n{suggestions}")
 
@@ -3063,9 +2213,9 @@ def generate_code_and_execute(
             answer_code = finetune_code_v2(
                 code_llm, task, answer_code, spec,
                 error=(
-                    "Policy violation in generated code: "
-                    + "; ".join(p_issues)
-                    + ". Remove destructive operations and do NOT hardcode spec; read artifacts/spec.json dynamically."
+                        "Policy violation in generated code: "
+                        + "; ".join(p_issues)
+                        + ". Remove destructive operations and do NOT hardcode spec; read artifacts/spec.json dynamically."
                 ),
                 tools=mcp_tools
             )
@@ -3076,15 +2226,16 @@ def generate_code_and_execute(
         print(Fore.RED + f"Guardrail violation: {e}")
 
     # --- METRIC VERIFICATION BLOCK ---
-    # Runs once after the while-loop has exited (either because is_ok became
-    # True or because the triage cap broke the loop). Any ``is_ok`` / retry
-    # mutations below are post-loop bookkeeping only — do NOT try to re-use
-    # loop-control keywords here.
     metrics = parse_metrics_from_stdout(last_stdout) or {}
 
     # 1. Check if model signaled "skipped" (Valid for EDA/Load)
     if metrics.get('type') == 'skipped':
         print(Fore.CYAN + "[INFO] Task signaled NO METRICS needed (type='skipped'). Proceeding.")
+        # If the code ran successfully (is_ok=True) and explicitly said "skipped", we are good.
+        # We ensure is_ok is set to True to exit loop if it wasn't already.
+        if heuristic_ok:
+            is_ok = True
+            # break  # Removed to avoid syntax error - loop will exit naturally
 
     # 2. If metrics not found in stdout, try LLM recovery on tail (training logs often bury METRICS_JSON)
     if not metrics and _should_try_metrics_llm_recovery(last_stdout, task):
@@ -3108,79 +2259,57 @@ def generate_code_and_execute(
         )
         # FIX: Use repr() for spec to avoid syntax errors in generated code
         verif_code = verification_code_gen(code_llm, spec, context=verif_ctx)
-        _v_ok, _v_issues = _audit_generated_code_policy(verif_code)
-        if not _v_ok:
-            print(Fore.YELLOW + f"[METRICS] verifier code blocked by policy: {_v_issues}; invoking agentic verifier repair")
-            verif_code = _agentic_repair_verifier_code(
-                code_llm=code_llm,
-                spec=spec,
-                initial_code=verif_code,
-                context=(
-                    f"Current task: {task}\n"
-                    "Need verifier that reads existing artifacts and emits METRICS_JSON without spec hardcoding."
-                ),
-                mcp_tools=mcp_tools,
-            )
         verif_res = orch.code_executor(verif_code, 'metric_check.py')
         metrics = parse_metrics_from_stdout(verif_res["output"])
 
     if metrics is None:
         metrics = {}
 
-    art_summary = ""
     try:
-        art_summary = update_project_context_after_execution(orch, task, last_stdout, last_errors, metrics, answer_code)
+        update_project_context_after_execution(orch, task, last_stdout, last_errors, metrics, answer_code)
     except Exception as e:
         print(Fore.RED + f"Failed to update project context: {e}")
-    # Knowledge Curator AFTER: record experiment result in experiments_ledger + lessons.
-    _curator_after(
-        orch, llm_fast, code_llm,
-        role="coder", task_hint=task or "",
-        trigger="after",
-        payload={
-            "metrics": metrics or {},
-            "stdout_tail": (last_stdout or "")[-1500:],
-            "errors_tail": (last_errors or "")[-1500:],
-        },
-    )
 
-    # 4. Validate metrics if they are supposed to exist.
-    # Double check "skipped" again in case verification script returned it.
+    # 4. Validate metrics if they are supposed to exist
+    # Double check "skipped" again in case verification script returned it
     if metrics.get('type') == 'skipped':
         print(Fore.CYAN + "[INFO] Verification confirmed NO METRICS needed.")
+        if heuristic_ok: is_ok = True  # Removed break to avoid syntax error
 
     _pm_name = str((spec.get('primary_metric') or {}).get('name', '')).lower()
     _got_name = str(metrics.get('name', '')).lower()
     if (metrics.get('type') != 'skipped') and ((not metrics) or (_got_name != _pm_name)):
         print(Fore.RED + f"[FAIL] Metric validation failed. Found: {metrics.keys()}")
-        print(Fore.YELLOW + "[FAIL] Proceeding without metrics (post-loop block — no retries possible here).")
+        # Limit verification retries to prevent infinite loops
+        if retry_count < orch.cfg.runtime.metric_validation_retry_limit:
+            answer_code = finetune_code_v2(
+                code_llm, task, answer_code, spec,
+                error=f"No specs metric found! Delete and add metric calculation {spec['primary_metric']['name']}"
+                , tools=mcp_tools)
+            is_ok = False  # Force retry
+            retry_count += 1
+            # continue  # Removed to avoid syntax error
+        else:
+            print(Fore.YELLOW + "[FAIL] Maximum verification retries exceeded. Proceeding without metrics.")
+            if heuristic_ok:
+                is_ok = True
+                # break  # Removed to avoid syntax error
+
+    retry_count += 1
+    if retry_count > orch.cfg.runtime.generation_retry_limit:
+        raise RuntimeError("Too many retries in code generation loop")
 
     # --- FINALIZATION ---
-    clean_code = answer_code.replace("```", "").replace("python", "")
-    _persist_last_code_artifact(orch, clean_code)
-
-    # Persist metrics artifact for external checkers (even when type='skipped').
-    try:
-        root = Path(orch.project_root)
-        final_dir = root / orch.cfg.paths.artifacts_dir / "final"
-        _ensure_dir(final_dir)
-        orch.write_file(
-            str(final_dir / "metrics.json"),
-            json.dumps(metrics or {}, ensure_ascii=False, indent=2),
-        )
-    except Exception as e:
-        print(Fore.YELLOW + f"[WARN] could not write final metrics.json: {e}")
-
     if metrics and metrics.get('type') != 'skipped':
         print(Fore.GREEN + f"METRICS => {metrics}")
         try:
+            clean_code = answer_code.replace("```", "").replace("python", "")
             _update_best_from_candidate(
                 orch,
                 candidate_metrics=metrics,
                 code_text=clean_code,
                 tag=("main_run" if not improve_mode else "improve_inline"),
                 enforce_validation=bool(improve_mode),
-                spec=spec,
             )
         except Exception as e:
             print(Fore.YELLOW + f"[WARN] could not persist metrics/version: {e}")
@@ -3193,25 +2322,129 @@ def generate_code_and_execute(
         last_stdout = shorten_string_middle(last_stdout, orch.cfg.runtime.execution_output_shorten_target)
 
     orch.log("final_code_result", {"task": shorten_string_middle(task, 200), "preview": last_stdout[:500]})
+
     if leaf_id:
+        def _extract_traceback_info(stderr: str) -> Tuple[Optional[str], Optional[str]]:
+            if not stderr:
+                return None, None
+
+            lines = stderr.splitlines()
+
+            # Regex: matches a bare Python exception type line with optional ": message"
+            exc_re = re.compile(
+                r'^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Interrupt|Exit|StopIteration))'
+                r'(?::\s*(.*))?$'
+            )
+
+            # Walk backwards to find the last line that looks like a terminal exception
+            for line in reversed(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                m = exc_re.match(stripped)
+                if m:
+                    exc_type = m.group(1)
+                    exc_msg = (m.group(2) or "").strip() or None
+                    return exc_type, exc_msg
+
+            return "Could not identify error.", "Could not identify error message."
+
+        combined = (last_stdout or "") + "\n" + (last_errors or "")
+        error_type, error_message = _extract_traceback_info(combined)
+
+        attempts_hist = []
+        try:
+            attempts_hist = (orch.state_get(incident_node_id) or {}).get("attempts", []) or []
+        except Exception:
+            attempts_hist = []
+        last_attempt = attempts_hist[-1] if attempts_hist else {}
+        action = last_attempt.get("route")
+        action_described = {
+            "install": "Attempted to install packages with pip.",
+            "bash": "Ran a bash command.",
+            "coding": "Updated the code.",
+            "lead": "Consulted Lead Agent for suggestions.",
+            "spec_update": "Updated spec.json.",
+        }
+        last_action = action_described.get(action, "Unknown action.")
+        last_timeout = int((last_time_prediction or 0) * 1.2)
+
+        # code exec timeout
+        if last_exit_code == 124:
+            orch.tree_update_insight(leaf_id, {
+                "status": "timed_out",
+                "exit_code": last_exit_code,
+                "bottleneck_diagnosed": f"Code execution timed out after {last_timeout}s (predicted {last_time_prediction}s + 20% buffer).",
+                "last_action": last_action,
+                "code_run_count": triage_iter_count,
+                "last_error_type": error_type,
+                "last_error_message": error_message,
+                "last_code_runtime": last_actual_time,
+                "last_predicted_time": last_time_prediction
+            })
+        # triage fix attempts limit hit
+        elif triage_iter_count > max_triaeg_iters:
+            last_triage = next(
+                (a for a in reversed(attempts_hist) if a.get("phase") == "triage"), None
+            )
+            bottleneck = (last_triage or {}).get("reason", "cause unavailable")
+            orch.tree_update_insight(leaf_id, {
+                "status": "failed_exhausted",
+                "exit_code": last_exit_code,
+                "bottleneck_diagnosed": f"Code execution failed. Triage attempted fixes but reached the retry limit. Cause: {bottleneck}",
+                "last_action": last_action,
+                "code_run_count": triage_iter_count - 1,
+                "last_error_type": error_type,
+                "last_error_message": error_message,
+                "last_code_runtime": last_actual_time,
+                "last_predicted_time": last_time_prediction
+            })
+        # triage didnt try to fix code
+        elif last_exit_code != 0:
+            orch.tree_update_insight(leaf_id, {
+                "status": "failed_no_retry",
+                "exit_code": last_exit_code,
+                "bottleneck_diagnosed": f"Code execution failed with exit code {last_exit_code}. Triage did not attempt a fix.",
+                "last_action": last_action,
+                "code_run_count": triage_iter_count,
+                "last_error_type": error_type,
+                "last_error_message": error_message,
+                "last_code_runtime": last_actual_time,
+                "last_predicted_time": last_time_prediction
+            })
+        # successful
+        else:
+            orch.tree_update_insight(leaf_id, {
+                "status": "succeeded",
+                "exit_code": last_exit_code,
+                "bottleneck_diagnosed": None,
+                "last_action": last_action,
+                "code_run_count": triage_iter_count,
+                "last_error_type": None,
+                "last_error_message": None,
+                "last_code_runtime": last_actual_time,
+                "last_predicted_time": last_time_prediction
+            })
+
         orch.tree_finish(leaf_id, status="done", meta={
             "iter_idx": iter_idx,
             "task": last_stdout,
             "script_file": f"{orch.cfg.paths.scripts_dir}/gen_code.py",
             "metrics": metrics or {},
-            "artifact_summary": art_summary
         })
     return str(last_stdout), answer_code
 
 
 def _is_eda_task(task_text: str) -> bool:
     t = (task_text or "").lower()
-    return any(k in t for k in ["initial data analysis", "initial data", "eda", "data analysis", "profil", "profiling", "data profiling"])
+    return any(k in t for k in ["initial data analysis", "initial data", "eda", "data analysis", "profil", "profiling",
+                                "data profiling"])
 
 
 def _is_feature_task(task_text: str) -> bool:
     t = (task_text or "").lower()
-    return any(k in t for k in ["feature engineering", "preprocessing", "preprocess", "feature extraction", "scaling", "encoding"])
+    return any(k in t for k in
+               ["feature engineering", "preprocessing", "preprocess", "feature extraction", "scaling", "encoding"])
 
 
 def _enforce_eda_feature_time_ratio(ordered_tasks: list[Any], target_ratio: float = 0.7) -> list[Any]:
@@ -3291,7 +2524,8 @@ def _select_root_tasks_with_priority(ordered_tasks: list[Any], max_tasks: int) -
 
     def is_final(tt: str) -> bool:
         t = (tt or "").lower()
-        return ("final" in t) and any(k in t for k in ["submission", "evaluation", "confusion_matrix", "confusion", "submit"])
+        return ("final" in t) and any(
+            k in t for k in ["submission", "evaluation", "confusion_matrix", "confusion", "submit"])
 
     selected: list[Any] = []
     used_idx: set[int] = set()
@@ -3367,7 +2601,7 @@ def main_pipeline(
                 print(
                     Fore.GREEN
                     + f"[RESUME] Deepest actionable node `{deep_id}` depth={d} status={st} "
-                    f"parent={parent_node_id!r} — continuing this branch (task text from node)."
+                      f"parent={parent_node_id!r} — continuing this branch (task text from node)."
                 )
             else:
                 print(
@@ -3404,7 +2638,8 @@ def main_pipeline(
     if force_simple and not (effective_depth >= max_depth_cfg):
         print(Fore.YELLOW + f"[MAIN] Max allowed depth {max_allowed_depth} reached. Forcing simple execution.")
     elif force_simple:
-        print(Fore.YELLOW + f"[MAIN] Max config depth {max_depth_cfg} reached (tree_depth={effective_depth}). Forcing direct execution.")
+        print(
+            Fore.YELLOW + f"[MAIN] Max config depth {max_depth_cfg} reached (tree_depth={effective_depth}). Forcing direct execution.")
 
     # Comment translated to English.
     verifier = FormalVerifier(llm=llm_fast)
@@ -3469,14 +2704,6 @@ def main_pipeline(
                 + "[SPEC] Fresh root — running spec pipeline: bootstrap → (LLM spec if needed) → datapath → probe → data_meta → write spec.json"
             )
             bootstrap_gpu_stack(orch, orch.cfg, llm_fast)
-            # Initialize git-anchored artifacts sandbox at the earliest point.
-            # Idempotent + silent on no-git environments.
-            try:
-                _base = ensure_artifacts_repo(orch)
-                if _base is not None:
-                    print(Fore.GREEN + f"[ARTIFACT-GIT] artifacts repo ready at {_base}")
-            except Exception as _e:
-                print(Fore.YELLOW + f"[ARTIFACT-GIT] init skipped: {_e}")
             if spec is None:
                 print(Fore.MAGENTA + "[SPEC] Step 1/4: LLM problem_spec_from_text (no usable spec.json yet).")
                 try:
@@ -3488,7 +2715,8 @@ def main_pipeline(
                     )
                     spec = default_spec_skeleton()
                     spec["constraints"] = dict(spec.get("constraints") or {})
-                    spec["constraints"]["notes"] = (spec["constraints"].get("notes") or "") + f" [SPEC_FALLBACK_LLM_ERROR: {e}]"
+                    spec["constraints"]["notes"] = (spec["constraints"].get(
+                        "notes") or "") + f" [SPEC_FALLBACK_LLM_ERROR: {e}]"
                 spec["hardware"] = {
                     "require_cuda": getattr(orch.cfg.hardware, "require_cuda", False),
                     "fail_if_no_cuda": getattr(orch.cfg.hardware, "fail_if_no_cuda", False),
@@ -3511,7 +2739,6 @@ def main_pipeline(
                 spec = probe_dataset_with_bash(orch, spec)
                 max_samples = getattr(getattr(orch.cfg, "data_check", object()), "max_samples_per_dir", 200)
                 spec = build_data_meta(orch, llm_fast, spec, task, max_samples_per_dir=max_samples)
-                spec = _reconcile_submission_columns_from_sample(orch, spec)
                 try:
                     spec = attach_hardware_to_spec(
                         orch, spec, limit_files=orch.cfg.runtime.attach_hardware_limit_files
@@ -3522,8 +2749,8 @@ def main_pipeline(
                 print(
                     Fore.YELLOW
                     + "[SPEC] Step 1/4: SKIPPED LLM spec — spec already loaded from artifacts/spec.json. "
-                    "Delete artifacts/spec.json to force full LLM spec + datapath. "
-                    "Running probe/meta refresh only (below)."
+                      "Delete artifacts/spec.json to force full LLM spec + datapath. "
+                      "Running probe/meta refresh only (below)."
                 )
                 if not freeze_spec:
                     try:
@@ -3533,14 +2760,11 @@ def main_pipeline(
                     if not (spec or {}).get("data", {}).get("meta"):
                         max_samples = getattr(getattr(orch.cfg, "data_check", object()), "max_samples_per_dir", 200)
                         spec = build_data_meta(orch, llm_fast, spec, task, max_samples_per_dir=max_samples)
-                    spec = _reconcile_submission_columns_from_sample(orch, spec)
 
             spec_path = f"{orch.cfg.paths.artifacts_dir}/spec.json"
             spec = clean_specs(spec)
             spec = merge_default_secondary_metrics(spec)
-            spec = _reconcile_submission_columns_from_sample(orch, spec)
             spec['project_root'] = str(orch.project_root)
-            print(Fore.CYAN + f"[SPEC] submission.columns={((spec.get('submission') or {}).get('columns') or [])}")
             orch.write_file(spec_path, json.dumps(spec, ensure_ascii=False, indent=2))
             print(Fore.CYAN + f"[SPEC]\n{json.dumps(spec, indent=2)}")
 
@@ -3595,7 +2819,7 @@ def main_pipeline(
             print(
                 Fore.YELLOW
                 + f"[SPEC] Fresh-root spec pipeline SKIPPED — not a fresh root (node_id={node_id!r}). "
-                "Typical on --resume with an existing tree: go straight to saved plan / children."
+                  "Typical on --resume with an existing tree: go straight to saved plan / children."
             )
             if spec is None or not isinstance(spec, dict):
                 try:
@@ -3618,18 +2842,6 @@ def main_pipeline(
         spec.setdefault("secondary_metrics", [])
         spec.setdefault("data", {})
         spec.setdefault("submission", {"columns": []})
-
-        # Knowledge Curator BOOTSTRAP: seed canonical MD files from the finalized spec (once per run).
-        if not getattr(orch, "_curator_bootstrapped", False):
-            try:
-                _curator_after(
-                    orch, llm_fast, llm_strong,
-                    role="planner", task_hint=task or "",
-                    trigger="bootstrap",
-                    payload={"spec_excerpt": {k: spec.get(k) for k in ("primary_metric", "submission", "data")}},
-                )
-            finally:
-                orch._curator_bootstrapped = True
 
         _rem_g_main = _global_remaining_sec(orch)
         _min_split_main = int(getattr(orch.cfg.orchestration, "min_remaining_sec_to_split", 600))
@@ -3759,10 +2971,6 @@ def main_pipeline(
                                     f"You can generate a maximum of {max_allowed_width} sub-tasks. "
                                     f"REMAINING_TOTAL_TIME_SEC={_rem_g_main} MIN_SPLIT_SEC={_min_split_main}."
                                 )
-                                # Knowledge Curator BEFORE: inject canonical brief/schema/lessons for planner.
-                                _cur_plan_ctx = _curator_before(orch, llm_fast, llm_strong, role="planner", task_hint=task or "")
-                                if _cur_plan_ctx:
-                                    width_prompt += "\n" + _cur_plan_ctx
                                 sub_tasks = generate_tasks_with_retry(
                                     llm_strong, task, spec, previous_answers,
                                     tasks_history,
@@ -3816,12 +3024,8 @@ def main_pipeline(
 
                     if len(ordered_tasks) > max_allowed_width:
                         print(
-                            Fore.YELLOW
-                            + f"[WIDTH_LIMIT] Truncating {len(ordered_tasks)} tasks to {max_allowed_width} "
-                            "(priority: EDA, features, final stages)."
-                        )
+                            Fore.YELLOW + f"[WIDTH_LIMIT] Prioritizing {len(ordered_tasks)} tasks to {max_allowed_width} (EDA → features → final).")
                         ordered_tasks = _select_root_tasks_with_priority(ordered_tasks, max_allowed_width)
-
 
                     def _clean_t(t):
                         import re, ast
@@ -3868,26 +3072,6 @@ def main_pipeline(
             mt_context = "Main Task Information: " + task + "\n" + "\n".join(task_strings)
 
         i = 0
-        # Anti-thrashing guardrails for tail replanning:
-        # allow multiple replans, but only with execution progress between them.
-        _replan_calls = 0
-        _replan_nochange_streak = 0
-        _replan_disabled = False
-        _last_replan_at_i = -1
-        try:
-            _replan_max_calls = int(getattr(orch.cfg.orchestration, "replan_max_calls", 3) or 3)
-        except Exception:
-            _replan_max_calls = 3
-        try:
-            _replan_cooldown_steps = int(getattr(orch.cfg.orchestration, "replan_cooldown_steps", 1) or 1)
-        except Exception:
-            _replan_cooldown_steps = 1
-        try:
-            _replan_min_remaining_sec = int(
-                getattr(orch.cfg.orchestration, "min_remaining_sec_to_split", 600) or 600
-            )
-        except Exception:
-            _replan_min_remaining_sec = 600
         while i < len(ordered_tasks):
             current_task_obj = ordered_tasks[i]
             current = current_task_obj.get("task", "") if isinstance(current_task_obj, dict) else str(current_task_obj)
@@ -3921,25 +3105,11 @@ def main_pipeline(
             # Tail replan: after at least one subtask finished (i>0), optionally shrink/reorder remaining tasks.
             # Previously gated with `not is_root` and `effective_depth > 1`, which disabled replanning for the
             # root meta-plan and all depth-1 branches — so long root-stage lists never hit the replanner.
-            _recent_text = (full_answer or "")[-4000:].lower()
-            _rate_limited_recent = (
-                "429" in _recent_text
-                or "rate limit" in _recent_text
-                or "too many requests" in _recent_text
-            )
-            _remaining_now = max(0, int(_global_remaining_sec(orch)))
-            _progress_since_last_replan = (i - _last_replan_at_i) >= max(1, _replan_cooldown_steps)
             _replan_ok = (
-                i > 0
-                and not prev_child_failed
-                and max_allowed_width > 1
-                and not resume
-                and not _replan_disabled
-                and _replan_calls < max(0, _replan_max_calls)
-                and _replan_nochange_streak < 2
-                and _progress_since_last_replan
-                and not _rate_limited_recent
-                and _remaining_now >= max(120, _replan_min_remaining_sec)
+                    i > 0
+                    and not prev_child_failed
+                    and max_allowed_width > 1
+                    and not resume
             )
             if _replan_ok:
                 print(Fore.MAGENTA + f"[REPLANNING] Checking if remaining tasks need adjustment...")
@@ -3951,39 +3121,19 @@ def main_pipeline(
                 )
 
                 # Calculate remaining time
-                current_remaining = _remaining_now
+                current_remaining = max(0, int(_global_remaining_sec(orch)))
                 _tail_cap = max(0, max_allowed_width - i)
                 # Avoid HARD_CAP=0 when the tail is non-empty (width/index edge cases).
                 if _tail_cap == 0 and remaining_tasks:
                     _tail_cap = len(remaining_tasks)
-                # Relax the cap when the spec has accumulated extra_budget to burn.
-                _eb = int(spec.get("_extra_budget_sec", 0)) if spec else 0
-                if _eb >= 600 and current_remaining > 0 and (_eb / max(1, current_remaining)) >= 0.2:
-                    _tail_cap = _tail_cap + max(2, int(_eb // 1800))
-                    print(Fore.CYAN + f"[REPLAN] Budget relaxation active: tail_cap raised to {_tail_cap} (extra_budget={_eb}s)")
-                _replan_calls += 1
-                _last_replan_at_i = i
-                # Knowledge Curator BEFORE: give replanner a snapshot of current brief/lessons/pruned.
-                _cur_rp_ctx = _curator_before(orch, llm_fast, llm_strong, role="replanner", task_hint=task or "")
-                if _cur_rp_ctx:
-                    context_for_replan = (context_for_replan or "") + "\n" + _cur_rp_ctx
-                try:
-                    replanning_result = replanning_agent(
-                        llm_strong,
-                        task,
-                        context_for_replan,
-                        remaining_tasks,
-                        remaining_time=current_remaining,
-                        max_tail_tasks=_tail_cap,
-                        extra_budget_sec=int(spec.get("_extra_budget_sec", 0)) if spec else 0,
-                    )
-                except Exception as e:
-                    print(Fore.YELLOW + f"[REPLANNING] failed ({e}); disabling further replanning in this branch.")
-                    _replan_disabled = True
-                    replanning_result = {
-                        "updated_remaining_tasks": remaining_tasks,
-                        "reasoning": f"fallback_after_replan_error: {e}",
-                    }
+                replanning_result = replanning_agent(
+                    llm_strong,
+                    task,
+                    context_for_replan,
+                    remaining_tasks,
+                    remaining_time=current_remaining,
+                    max_tail_tasks=_tail_cap,
+                )
                 if replanning_result.get("escalate_to_parent"):
                     print(Fore.YELLOW + "[REPLANNING] escalate_to_parent=true: stopping this branch; parent continues.")
                     old_cids_to_abandon = child_ids[i:]
@@ -3993,7 +3143,8 @@ def main_pipeline(
                             for old_cid in old_cids_to_abandon:
                                 if orch.tree_node_status(old_cid) not in ("done", "failed"):
                                     task_text = str(orch.tree_node(old_cid).get("task", ""))
-                                    f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] REPLAN ESCALATE: {task_text}\n")
+                                    f.write(
+                                        f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] REPLAN ESCALATE: {task_text}\n")
                                     orch.tree_log_event(
                                         "PRUNED",
                                         task_text,
@@ -4016,61 +3167,6 @@ def main_pipeline(
                 else:
                     updated_remaining = []
 
-                # Re-check remaining time AFTER LLM thinking consumed real seconds.
-                # LLM replanning itself can take 10-60s; task budgets must fit reality.
-                _post_replan_remaining = _global_remaining_sec(orch)
-                _planned_total = sum(
-                    int(t.get("time_budget_sec", _db_tb)) if isinstance(t, dict) else _db_tb
-                    for t in updated_remaining
-                )
-                if _planned_total > _post_replan_remaining > 0:
-                    _budget_scale = _post_replan_remaining / _planned_total
-                    for _t in updated_remaining:
-                        if isinstance(_t, dict) and "time_budget_sec" in _t:
-                            _t["time_budget_sec"] = max(30, int(_t["time_budget_sec"] * _budget_scale))
-                    print(
-                        Fore.YELLOW
-                        + f"[REPLANNING] Budget rescaled after LLM think-time: "
-                        + f"planned={_planned_total}s > actual_remaining={_post_replan_remaining}s "
-                        + f"(scale={_budget_scale:.2f})"
-                    )
-
-                # Submission-terminal guard: ensure the replanned tail still ends in
-                # a submission-shaped task. Without this, a replan that prunes the
-                # final predict/submission node leaves the DAG with no successor —
-                # observed in run 2026-05-08T02-10-14 (wids-datathon-2020) where the
-                # predict node was PRUNED via main_replanning with nothing added.
-                def _is_submission_task(_t: Any) -> bool:
-                    _txt = _t.get("task", "") if isinstance(_t, dict) else str(_t)
-                    return bool(re.search(r"submission|submit", _txt or "", re.I))
-
-                _has_submission = any(_is_submission_task(_t) for _t in updated_remaining)
-                _orig_had_submission = any(_is_submission_task(_t) for _t in remaining_tasks)
-                if not _has_submission and (_post_replan_remaining > 0 or _orig_had_submission):
-                    _inject_budget = max(120, min(600, int(max(0, _post_replan_remaining))))
-                    _inject_task = {
-                        "task": (
-                            "Generate the final submission file (submission.py / submission.csv) "
-                            "from the best available trained artifact (versions/index.json or "
-                            "artifacts/last/code.py) and save to the canonical submission path."
-                        ),
-                        "time_budget_sec": _inject_budget,
-                    }
-                    if updated_remaining:
-                        updated_remaining.append(_inject_task)
-                        print(
-                            Fore.YELLOW
-                            + "[REPLANNING] Submission-terminal guard: injected missing "
-                            + f"submission task (budget={_inject_budget}s)."
-                        )
-                    else:
-                        updated_remaining = [_inject_task]
-                        print(
-                            Fore.YELLOW
-                            + "[REPLANNING] Submission-terminal guard: replanner cleared queue; "
-                            + f"forcing submission collapse (budget={_inject_budget}s)."
-                        )
-
                 # Check for changes
                 plan_changed = False
                 rem_norm = _normalize_plan_tail_entries(remaining_tasks, _db_tb)
@@ -4085,7 +3181,6 @@ def main_pipeline(
                             break
 
                 if plan_changed:
-                    _replan_nochange_streak = 0
                     msg = Fore.YELLOW + f"[REPLANNING] Plan updated! Reason: {replanning_result.get('reasoning', 'No reason given')}"
                     try:
                         print(msg)
@@ -4103,7 +3198,8 @@ def main_pipeline(
                             for old_cid in old_cids_to_abandon:
                                 if orch.tree_node_status(old_cid) not in ("done", "failed"):
                                     task_text = str(orch.tree_node(old_cid).get("task", ""))
-                                    f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] REPLAN PRUNED: {task_text}\n")
+                                    f.write(
+                                        f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] REPLAN PRUNED: {task_text}\n")
                                     orch.tree_log_event(
                                         "PRUNED",
                                         task_text,
@@ -4125,7 +3221,8 @@ def main_pipeline(
                         kinds=["main"] * len(ordered_tasks[i:])
                     )
                     try:
-                        new_labels = [f"Sub-Task {t.get('task') if isinstance(t, dict) else t}" for t in ordered_tasks[i:]]
+                        new_labels = [f"Sub-Task {t.get('task') if isinstance(t, dict) else t}" for t in
+                                      ordered_tasks[i:]]
                         for ncid, lbl in zip(new_child_ids, new_labels):
                             orch.tree_log_event(
                                 "ADDED",
@@ -4151,20 +3248,15 @@ def main_pipeline(
                                                                                                       dict) else None
                     cid = child_ids[i]
                 else:
-                    _replan_nochange_streak += 1
                     print(Fore.GREEN + "[REPLANNING] Plan is still optimal. Proceeding.")
-                    # Do not spend additional cycles on repeated no-op replanning.
-                    if _replan_nochange_streak >= 2:
-                        _replan_disabled = True
-                        print(Fore.YELLOW + "[REPLANNING] Disabled for this branch after no-op result.")
 
             elif (
-                i > 0
-                and not prev_child_failed
-                and max_allowed_width > 1
-                and resume
-                and len(ordered_tasks) > 2
-                and i == 1
+                    i > 0
+                    and not prev_child_failed
+                    and max_allowed_width > 1
+                    and resume
+                    and len(ordered_tasks) > 2
+                    and i == 1
             ):
                 print(
                     Fore.YELLOW
@@ -4174,27 +3266,12 @@ def main_pipeline(
             print(
                 f"Sub-Task [{i + 1}/{len(ordered_tasks)}] tree_depth={_child_tree_depth} pipeline_level={depth + 1} {current} (status: {child_status})"
             )
-            # Pass actual remaining time and effective budget to agents via spec
-            actual_remaining = _global_remaining_sec(orch)
             if current_time_budget:
-                effective_budget = min(int(current_time_budget), int(actual_remaining)) if actual_remaining > 0 else int(current_time_budget)
-                print(Fore.CYAN + f"   -> Task Budget: {effective_budget}s (planned={current_time_budget}s, global_remaining={int(actual_remaining)}s)")
-            else:
-                effective_budget = int(actual_remaining) if actual_remaining > 0 else 0
-                print(Fore.CYAN + f"   -> Task Budget: {effective_budget}s (from global remaining)")
-            if spec is not None:
-                spec["_current_task_budget_sec"] = effective_budget
-                spec["_global_remaining_sec"] = int(actual_remaining)
+                print(Fore.CYAN + f"   -> Allocated Time Budget: {current_time_budget} seconds")
+                if spec is not None:
+                    spec["_current_task_budget_sec"] = current_time_budget
+                orch.tree_update_insight(main_node_id, {"allocated_time_total": current_time_budget})
 
-            _task_start_time = time.time()
-            # Git-anchored pre-snapshot of artifacts_dir. Ground-truth diffing
-            # against this sha at the end of the subtask replaces regex-based
-            # "did the agent actually save this?" heuristics.
-            try:
-                _pre_sha = snapshot_artifacts(orch, message=f"pre-subtask {cid}")
-                orch._last_artifacts_snapshot_sha = _pre_sha  # type: ignore[attr-defined]
-            except Exception as _e:
-                print(Fore.YELLOW + f"[ARTIFACT-GIT] pre-snapshot skipped: {_e}")
             try:
                 temp_answer, code_answer = main_pipeline(
                     orch,
@@ -4216,10 +3293,10 @@ def main_pipeline(
                     max_allowed_depth=max_allowed_depth - 1,
                     max_allowed_width=(99 if depth == 0 else max(1, max_allowed_width - 1))
                 )
-            except (TimeoutError, Exception) as e:
-                # Do not abort the entire root pipeline on hard deadline or provider crash.
+            except TimeoutError as e:
+                # IMPORTANT: Do not abort the entire root pipeline on hard deadline.
                 # Instead: stop executing remaining subtasks and allow root finalization/improver to run.
-                msg = Fore.YELLOW + f"[DEADLINE/ERROR] {type(e).__name__}: {e} Stopping remaining tasks in this branch."
+                msg = Fore.YELLOW + f"[DEADLINE] {e} Stopping remaining tasks in this branch."
                 try:
                     print(msg)
                 except UnicodeEncodeError:
@@ -4248,16 +3325,6 @@ def main_pipeline(
                 temp_answer = str(temp_answer) if temp_answer is not None else ""
 
             full_answer = (full_answer or "") + temp_answer + "\n"
-
-            # Track budget savings from early-finishing tasks
-            if effective_budget and effective_budget > 0:
-                actual_task_elapsed = time.time() - _task_start_time
-                saved_sec = max(0, int(effective_budget - actual_task_elapsed))
-                if saved_sec > 30 and spec is not None:
-                    extra_budget = spec.get("_extra_budget_sec", 0) + saved_sec
-                    spec["_extra_budget_sec"] = extra_budget
-                    print(Fore.CYAN + f"[BUDGET] Task saved {saved_sec}s. Extra budget pool: {extra_budget}s")
-
             i += 1
 
         # Comment translated to English.
@@ -4282,48 +3349,28 @@ def main_pipeline(
 
                 ok, norm, _ = _validate_and_normalize_metrics(last_m)
                 if not ok:
-                    if _global_remaining_sec(orch) <= 0:
-                        print(Fore.YELLOW + "[ROOT] metrics recovery skipped: no global time remaining")
-                        ok = False
-                        norm = {}
-                    else:
-                        print(
-                            Fore.YELLOW + "[ROOT] last metrics invalid or missing — running verification to recover METRICS_JSON")
-                        verif_code = verification_code_gen(code_llm, spec,
-                                                           context="Look into ./artifacts for checkpoints/preds.")
-                        _v_ok, _v_issues = _audit_generated_code_policy(verif_code)
-                        if not _v_ok:
-                            print(Fore.YELLOW + f"[ROOT] verifier code blocked by policy: {_v_issues}; invoking agentic verifier repair")
-                            verif_code = _agentic_repair_verifier_code(
-                                code_llm=code_llm,
-                                spec=spec,
-                                initial_code=verif_code,
-                                context=(
-                                    "Root post-subtask metric recovery. "
-                                    "Verifier must use filesystem evidence and dynamic spec loading."
-                                ),
-                                mcp_tools=mcp_tools,
-                            )
-                        vfile = f"{orch.cfg.paths.scripts_dir}/verify_root_{uuid.uuid4().hex[:6]}.py"
-                        orch.write_file(vfile, verif_code)
-                        vres = orch.run_python_file(vfile, stream=True)
-                        recov = parse_metrics_from_stdout(vres.get("output", ""))
-                        ok, norm, _ = _validate_and_normalize_metrics(recov)
-                        if ok:
-                            _update_best_from_candidate(
-                                orch,
-                                candidate_metrics=norm,
-                                code_text=last_c,
-                                tag="main_post_subtasks",
-                                spec=spec,
-                            )
+                    print(
+                        Fore.YELLOW + "[ROOT] last metrics invalid or missing — running verification to recover METRICS_JSON")
+                    verif_code = verification_code_gen(code_llm, spec,
+                                                       context="Look into ./artifacts for checkpoints/preds.")
+                    vfile = f"{orch.cfg.paths.scripts_dir}/verify_root_{uuid.uuid4().hex[:6]}.py"
+                    orch.write_file(vfile, verif_code)
+                    vres = orch.run_python_file(vfile, stream=True)
+                    recov = parse_metrics_from_stdout(vres.get("output", ""))
+                    ok, norm, _ = _validate_and_normalize_metrics(recov)
+                    if ok:
+                        _update_best_from_candidate(
+                            orch,
+                            candidate_metrics=norm,
+                            code_text=last_c,
+                            tag="main_post_subtasks",
+                        )
                 else:
                     _update_best_from_candidate(
                         orch,
                         candidate_metrics=norm,
                         code_text=last_c,
                         tag="main_post_subtasks",
-                        spec=spec,
                     )
             except Exception as e:
                 print(Fore.YELLOW + f"[ROOT] metrics post-check failed: {e}")
@@ -4385,16 +3432,6 @@ def main_pipeline(
                         if resume_imp_id:
                             print(Fore.YELLOW + f"[RESUME] Resuming existing improvement node: {resume_imp_id}")
 
-                        # Collect and deeply analyze main pipeline artifacts (ReAct agent, 5 steps)
-                        _main_artifacts = _collect_and_enrich_artifacts(
-                            orch, spec, llm_strong, task,
-                            previous_iteration_context=spec.get("_inter_iteration_context"),
-                        )
-                        if _main_artifacts:
-                            spec["_main_pipeline_artifacts"] = _main_artifacts
-                            _ma_keys = [k for k in _main_artifacts if isinstance(_main_artifacts[k], str)]
-                            print(Fore.CYAN + f"[IMPROVER] Enriched artifacts collected: {_ma_keys}")
-
                         imp_summary, imp_best = improvement_pipeline(
                             orch=orch,
                             llm_strong=llm_strong,
@@ -4407,8 +3444,7 @@ def main_pipeline(
                             parent_node_id=main_node_id,
                             resume=True,
                             mcp_tools=mcp_tools,
-                            depth=depth + 1,
-                            main_pipeline_artifacts=_main_artifacts,
+                            depth=depth + 1
                         )
                         if imp_summary:
                             try:
@@ -4454,30 +3490,9 @@ def main_pipeline(
 
             gate = run_final_output_gate(orch, spec or {}, task_txt_root=Path(orch.project_root))
             if not gate.get("ok"):
-                # Re-run the selector with more ReAct rounds — it can add/fix submission code
-                # using the existing code generation pipeline.  Do NOT generate a blind recovery
-                # script (that tends to produce sample-copy or constant predictions).
-                print(Fore.YELLOW + "[FINAL] Output gate failed. Re-running selector with extended repair...")
-                print(Fore.YELLOW + "Gate errors: " + "; ".join(gate.get("errors") or []))
-                try:
-                    _cfg_orc = getattr(orch.cfg, "orchestration", object())
-                    _prev_rounds = int(getattr(_cfg_orc, "react_max_rounds", 3) or 3)
-                    _cfg_orc.react_max_rounds = max(_prev_rounds, 5)
-                except Exception:
-                    pass
-                try:
-                    final_sub2 = _finalize_single_submission_by_all_metrics_llm(
-                        orch, llm_fast, spec or {}, task=task, code_llm=code_llm, mcp_tools=mcp_tools
-                    )
-                    if final_sub2:
-                        print(Fore.CYAN + f"[FINAL] Selector retry produced: {final_sub2}")
-                except Exception as e:
-                    print(Fore.RED + f"[FINAL] Selector retry failed: {e}")
-                gate = run_final_output_gate(orch, spec or {}, task_txt_root=Path(orch.project_root))
-            if not gate.get("ok"):
-                gate_errs = "; ".join(gate.get("errors") or [])
-                print(Fore.RED + f"[FINAL] No valid submission produced. Errors: {gate_errs}")
-                raise RuntimeError("[FINAL] output gate failed: " + gate_errs)
+                raise RuntimeError(
+                    "[FINAL] output gate failed: " + "; ".join(gate.get("errors") or [])
+                )
             print(Fore.GREEN + "[FINAL] output gate passed (canonical submission + validation)")
 
         # Comment translated to English.
@@ -4506,125 +3521,13 @@ def main_pipeline(
                 f"[EXECUTION OUTPUT TAIL]\n{exec_tail}\n\n"
                 f"[LAST CODE TAIL]\n{code_tail}\n"
             )
-        # Artifact provenance: scan stdout/project log for claimed saves, keep
-        # only the ones that actually exist on disk. Prevents the aggregate
-        # agent from hallucinating artifacts copied out of the task description.
-        _verify_blobs = [full_answer or "", project_log_content or ""]
-        _artifact_check = _verify_claimed_artifacts(orch, _verify_blobs)
-        _verified_paths = _artifact_check.get("verified") or []
-        _missing_paths = _artifact_check.get("missing") or []
-
-        # Ground truth via git-anchored snapshot diff of artifacts_dir. This
-        # bypasses regex-guessing entirely: files that appear in git diff were
-        # physically written to disk during the subtask. Prefer these paths.
-        # Safe to call even without git — returns empty structures in that case.
-        _pre_sha = getattr(orch, "_last_artifacts_snapshot_sha", None)
-        _post_sha = snapshot_artifacts(orch, message=f"post-subtask {getattr(orch, 'current_node_id', '')}")
-        orch._last_artifacts_snapshot_sha = _post_sha  # type: ignore[attr-defined]
-        _git_diff = artifacts_diff_since(orch, _pre_sha) if _pre_sha else {"added": [], "modified": [], "deleted": []}
-        _git_written = [
-            f"{orch.cfg.paths.artifacts_dir}/{p}"
-            for p in (_git_diff.get("added", []) + _git_diff.get("modified", []))
-        ]
-        # Merge git ground truth into verified paths (primary) while keeping
-        # regex-claimed for backwards compat on writes that happened outside
-        # artifacts_dir (we still want to know about them).
-        if _git_written:
-            _seen = set(_verified_paths)
-            for p in _git_written:
-                if p not in _seen:
-                    _verified_paths.append(p)
-                    _seen.add(p)
-            print(Fore.GREEN + f"[ARTIFACT-GIT] post-snapshot={(_post_sha or '')[:8]} "
-                               f"added={len(_git_diff.get('added', []))} "
-                               f"modified={len(_git_diff.get('modified', []))} "
-                               f"deleted={len(_git_diff.get('deleted', []))}")
-        if _verified_paths or _missing_paths:
-            print(
-                Fore.CYAN
-                + f"[ARTIFACT] verified={len(_verified_paths)} missing={len(_missing_paths)}"
-            )
-            if _missing_paths:
-                print(Fore.YELLOW + f"[ARTIFACT] claimed but not on disk: {_missing_paths[:5]}")
-        answer = aggregate_answers(
-            llm_fast,
-            task,
-            log_context,
-            spec,
-            verified_artifacts=_verified_paths,
-            claimed_but_missing=_missing_paths,
-        )
+        answer = aggregate_answers(llm_fast, task, log_context, spec)
 
         # --- FIX: Ensure answer is a string ---
         if isinstance(answer, list):
             answer = "\n".join(map(str, answer))
         elif not isinstance(answer, str):
             answer = str(answer)
-
-        if is_root and llm_fast is not None:
-            try:
-                art_dir = Path(orch.project_root) / orch.cfg.paths.artifacts_dir
-                code_summary_chk = ""
-                for p in (
-                    art_dir / "final" / "best_code.py",
-                    art_dir / "best" / "code.py",
-                    art_dir / "last" / "code.py",
-                ):
-                    try:
-                        if p.exists():
-                            code_summary_chk = p.read_text(encoding="utf-8", errors="ignore")
-                            break
-                    except Exception:
-                        pass
-                if not code_summary_chk and code_bank:
-                    code_summary_chk = code_bank[-1]
-                code_summary_chk = shorten_string_middle(code_summary_chk or "", 2500)
-                metrics_json_chk = ""
-                for mp in (art_dir / "best" / "metrics.json", art_dir / "last" / "metrics.json"):
-                    try:
-                        if mp.exists():
-                            metrics_json_chk = mp.read_text(encoding="utf-8", errors="ignore")
-                            break
-                    except Exception:
-                        pass
-                metrics_json_chk = shorten_string_middle(metrics_json_chk or "", 4000)
-                stdout_tail_chk = shorten_string_middle(full_answer or "", 4000)
-                nid_chk = str(main_node_id) if main_node_id else "root"
-                answer = check_and_fix_answer(
-                    orch,
-                    llm_fast,
-                    task,
-                    answer,
-                    spec or {},
-                    node_id=nid_chk,
-                    code_summary=code_summary_chk,
-                    metrics_json=metrics_json_chk,
-                    stdout_tail=stdout_tail_chk,
-                    stderr_tail="",
-                    improvement_summary="",
-                )
-            except Exception as e:
-                orch.log("check_and_fix_answer_skipped", {"error": str(e)})
-                print(Fore.YELLOW + f"[CHECK] check_and_fix_answer skipped: {e}")
-
-        if is_root and llm_fast is not None:
-            try:
-                rubric = checks_generation(llm_fast, task, spec or {})
-                rubric_txt = shorten_string_middle(str(rubric), 2500)
-                rubric_ok = check_answer(
-                    llm_fast, task, answer, rubric_txt, spec or {}
-                )
-                orch.log(
-                    "aggregate_rubric_check",
-                    {"verdict": rubric_ok, "rubric_head": rubric_txt[:400]},
-                )
-                if rubric_ok != "True":
-                    print(
-                        Fore.YELLOW
-                        + "[AGGREGATE] LLM rubric check did not pass on final summary (see orchestrator log)."
-                    )
-            except Exception as e:
-                orch.log("aggregate_rubric_check_skipped", {"error": str(e)})
 
         # Safe print for Windows consoles with legacy encodings (e.g. cp1251)
         try:
@@ -4647,40 +3550,6 @@ def main_pipeline(
         except Exception:
             pass
 
-        if is_root and llm_fast is not None:
-            try:
-                sec_entry = log_update_agent(
-                    llm_fast,
-                    task,
-                    "AGGREGATE_SUMMARY",
-                    shorten_string_middle(answer, 3500),
-                )
-                if (sec_entry or "").strip():
-                    head = (task or "").splitlines()[0][:240] if task else "Aggregate"
-                    orch.log_to_project_log(
-                        f"[Secretary] {head}",
-                        depth,
-                        sec_entry.strip(),
-                        "done",
-                    )
-            except Exception as e:
-                orch.log("log_update_agent_skipped", {"error": str(e)})
-            try:
-                agg_rel = f"{orch.cfg.paths.artifacts_dir}/aggregate_summary.md"
-                preview = shorten_string_middle(answer, 8000)
-                arch_note = artifact_reviewer_agent(llm_fast, agg_rel, preview)
-                if (arch_note or "").strip():
-                    orch.write_file(
-                        f"{orch.cfg.paths.artifacts_dir}/aggregate_summary_review.md",
-                        arch_note.strip(),
-                    )
-                    orch.log(
-                        "artifact_reviewer_aggregate",
-                        {"chars": len(arch_note.strip())},
-                    )
-            except Exception as e:
-                orch.log("artifact_reviewer_skipped", {"error": str(e)})
-
         # AUTO-DISCOVERY: Automatically update spec based on EDA findings
         # Check if this was an EDA task and if target column was discovered
         if "Initial Data Analysis" in task:
@@ -4691,16 +3560,17 @@ def main_pipeline(
                 "DEBUG: Target Distribution in Train Data:",
                 "DEBUG: Train Target Distribution:"
             ]
-            
+
             pattern_found = False
             for pattern in target_patterns:
                 if pattern in project_log_content:
                     pattern_found = True
                     print(Fore.CYAN + f"[AUTO-DISCOVERY] Found target distribution pattern: {pattern}")
                     break
-            
+
             if pattern_found:
-                print(Fore.CYAN + "[AUTO-DISCOVERY] Found target distribution in logs, attempting to extract target column...")
+                print(
+                    Fore.CYAN + "[AUTO-DISCOVERY] Found target distribution in logs, attempting to extract target column...")
                 # Extract target column name from the log
                 import re
                 # Look for the actual target column name in the log output
@@ -4746,13 +3616,12 @@ def main_pipeline(
         return answer, None
 
 
-def update_project_context_after_execution(orch: GlobalOrchestrator, task: str, stdout: str, stderr: str, metrics: Dict[str, Any], code: str) -> str:
+def update_project_context_after_execution(orch: GlobalOrchestrator, task: str, stdout: str, stderr: str,
+                                           metrics: Dict[str, Any], code: str):
     """
     Append to `artifacts/project_context.md` with a compact, LLM-friendly block (rolling tail cap).
     Surfaces metric contract, shapes, outcomes; strips TensorFlow/absl noise from stderr.
-    Returns technical artifact specs discovered.
     """
-    artifact_summary = ""
     try:
         art_dir = orch.project_root / orch.dir_paths["artifacts"]
         context_path = art_dir / "project_context.md"
@@ -4779,11 +3648,9 @@ def update_project_context_after_execution(orch: GlobalOrchestrator, task: str, 
 
         lines: List[str] = []
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        # Keep full task text — truncating mid-string (shorten_string_middle) loses
-        # the acceptance criteria that live at the tail of task descriptions.
-        full_task = (task or "").replace("\n", " ").strip()
+        short_task = shorten_string_middle((task or "").replace("\n", " "), 160)
         lines.append(f"## Update [{ts}]")
-        lines.append(f"**Task**: {full_task}")
+        lines.append(f"**Task**: {short_task}")
         lines.append("")
         lines.append("**METRICS_JSON (contract)**")
         lines.append(f"- type: `calculated` | `skipped`")
@@ -4828,56 +3695,21 @@ def update_project_context_after_execution(orch: GlobalOrchestrator, task: str, 
                 if ln.strip() and not any(s in ln for s in skip_sub)
             )
             if "transformers_" in stderr_use:
-                error_hints.append("ERR: sklearn ColumnTransformer transformers_ accessed before fit -> inspect after fit_transform")
+                error_hints.append(
+                    "ERR: sklearn ColumnTransformer transformers_ accessed before fit -> inspect after fit_transform")
             if "joblib.loads" in stderr_use:
                 error_hints.append("ERR: joblib.loads() doesn't exist -> use deepcopy or joblib.load/dump")
             if "not JSON serializable" in stderr_use or "numpy" in stderr_use:
                 error_hints.append("ERR: numpy scalar JSON serialization -> convert numpy types or use NumpyEncoder")
             if "Metric validation failed" in stdout or "Invalid metrics" in stdout:
-                error_hints.append("ERR: METRICS_JSON contract mismatch -> ensure type='calculated', name matches spec, use 'primary'")
+                error_hints.append(
+                    "ERR: METRICS_JSON contract mismatch -> ensure type='calculated', name matches spec, use 'primary'")
 
         if error_hints:
             lines.append("")
             lines.append("**Errors / hints**:")
             for hint in error_hints[:8]:
                 lines.append(f"- {hint}")
-
-        # --- NEW: Automated Artifact Documentation ---
-        artifact_notes: List[str] = []
-        try:
-            # Files changed in the last 15 minutes
-            now = time.time()
-            for f in art_dir.glob("*"):
-                if f.is_file() and (now - f.stat().st_mtime) < 900:
-                    if f.name in ("project_context.md", "PROJECT_LOG.md", "spec.json", "last_run.log"):
-                        continue
-                    
-                    preview = ""
-                    if f.suffix.lower() == ".csv":
-                        try:
-                            with open(f, 'r', encoding='utf-8', errors='ignore') as cf:
-                                header = cf.readline().strip()
-                                preview = f"CSV with columns: {header}"
-                        except: pass
-                    elif f.suffix.lower() in (".pkl", ".pickle"):
-                        probe_code = f"import pickle, pandas as pd; \nwith open(r'{f}', 'rb') as pf: \n  obj = pickle.load(pf)\nif isinstance(obj, pd.DataFrame): print(f'DataFrame: shape={{obj.shape}}, columns={{list(obj.columns)}}')\nelif isinstance(obj, dict): \n  print(f'Dict: keys={{list(obj.keys())}}')\n  for k,v in list(obj.items())[:3]: print(f'  - {{k}}: {{type(v).__name__}}')\nelse: print(f'Type: {{type(obj).__name__}}')"
-                        res = orch.run_python_code(probe_code, filename="probe_art.py", timeout=20)
-                        preview = res.get("output", "").strip()
-                    
-                    if preview:
-                        _llm = getattr(orch, "llm_fast", None) or getattr(orch, "llm", None)
-                        if _llm is not None:
-                            note = artifact_reviewer_agent(_llm, str(f.name), preview)
-                            if note:
-                                artifact_notes.append(f"- **{f.name}**: {note.strip()}")
-        except Exception as e:
-            print(Fore.RED + f"[CONTEXT] Artifact probe failed: {e}")
-
-        if artifact_notes:
-            lines.append("")
-            lines.append("**Artifact Specs (verified)**:")
-            lines.extend(artifact_notes)
-            artifact_summary = "\n".join(artifact_notes)
 
         block = "\n".join(lines).strip() + "\n"
         prev = ""
@@ -4887,25 +3719,10 @@ def update_project_context_after_execution(orch: GlobalOrchestrator, task: str, 
             except Exception:
                 prev = ""
         merged = (prev.strip() + "\n\n" + block).strip() + "\n"
-        # Rolling cap BY SECTIONS, not by bytes — never cut mid-update.
-        # Keep the file header (everything before first "## Update") + the last N update sections.
-        # This preserves acceptance criteria and data passports while bounding size.
-        MAX_SECTIONS = 40
-        try:
-            parts = re.split(r"(?m)^(## Update \[)", merged)
-            if len(parts) >= 3:
-                header = parts[0]
-                # Re-glue each "## Update [" marker with its body
-                sections = ["## Update [" + parts[i + 1] for i in range(1, len(parts) - 1, 2)]
-                if len(sections) > MAX_SECTIONS:
-                    sections = sections[-MAX_SECTIONS:]
-                merged = (header.rstrip() + "\n\n" + "\n".join(sections)).strip() + "\n"
-        except Exception:
-            pass
+        if len(merged) > 12000:
+            merged = merged[-12000:]
 
         context_path.write_text(merged, encoding="utf-8")
-        print(Fore.GREEN + f"[CONTEXT] Appended project_context.md (section-capped, max {MAX_SECTIONS} updates)")
+        print(Fore.GREEN + "[CONTEXT] Appended rolling project_context.md (tail-capped)")
     except Exception as e:
         print(Fore.RED + f"[CONTEXT] Failed to update project context: {e}")
-    
-    return artifact_summary
