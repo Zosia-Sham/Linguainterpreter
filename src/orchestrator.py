@@ -10,7 +10,6 @@ from pathlib import Path
 from urllib.request import urlretrieve
 import re
 import shlex
-
 from colorama import Fore
 
 from .bash_agent import BashAgent
@@ -50,39 +49,12 @@ class GlobalOrchestrator:
         for p in self.dir_paths.values():
             p.mkdir(parents=True, exist_ok=True)
 
-        self.bash = BashAgent(
-            workdir=str(self.project_root),
-            min_exec_timeout_sec=cfg.runtime.min_exec_timeout_sec,
-            predictive_buffer_pct=cfg.runtime.predictive_buffer_pct,
-        )
+        self.bash = BashAgent(workdir=str(self.project_root))
         self.project = Project(cfg.runtime.project_name, self.project_root, self.project_root / cfg.paths.venv_dir)
-        
-        # Always resolve venv paths based on platform
-        if platform.system() == "Windows":
-            self.project.vpy = self.project.env_dir / "Scripts" / "python.exe"
-            self.project.vpip = self.project.env_dir / "Scripts" / "pip.exe"
-        else:
-            self.project.vpy = self.project.env_dir / "bin" / "python"
-            self.project.vpip = self.project.env_dir / "bin" / "pip"
-
         self.created_files: List[Path] = []
         self.steps: List[Dict[str, Any]] = []
-        
         if cfg.runtime.create_env:
             self._create_env()
-        else:
-            # If venv exists — use it; otherwise fall back to system python (no hard crash).
-            if not self.project.vpy.exists():
-                sys_py = detect_os()["python_exec"]
-                print(f"[VENV] .venv not found at {self.project.env_dir}. Falling back to system python: {sys_py}")
-                self.project.vpy = Path(sys_py)
-                # Derive pip path relative to system python
-                self.project.vpip = self.project.vpy.parent / (
-                    "pip.exe" if platform.system() == "Windows" else "pip"
-                )
-            else:
-                # venv exists but create_env=False — still ensure pip is healthy
-                self._ensure_pip()
 
     def _create_env(self):
         base_py = os.getenv("BASE_PYTHON", detect_os()["python_exec"])
@@ -94,38 +66,30 @@ class GlobalOrchestrator:
         )
         self.log("venv_create", {"exit": res["exit_code"], "stderr": res["stderr"], "log": res.get("log_path")})
 
-        if res.get("exit_code", 0) != 0:
-            # venv creation failed — fall back to system python so the run can continue
-            sys_py = detect_os()["python_exec"]
-            print(f"[VENV] WARNING: venv creation failed (exit={res.get('exit_code')}). "
-                  f"Falling back to system python: {sys_py}")
-            self.project.vpy = Path(sys_py)
-            self.project.vpip = self.project.vpy.parent / (
-                "pip.exe" if platform.system() == "Windows" else "pip"
-            )
-            return
+        if platform.system() == "Windows":
+            vpy = self.project.env_dir / "Scripts" / "python.exe"
+            vpip = self.project.env_dir / "Scripts" / "pip.exe"
+        else:
+            vpy = self.project.env_dir / "bin" / "python"
+            vpip = self.project.env_dir / "bin" / "pip"
+        self.project.vpy = vpy if vpy.exists() else None
+        self.project.vpip = vpip if vpip.exists() else None
 
-        self._ensure_pip()
-
-    def _ensure_pip(self):
-        """Verify pip exists and proactively repair it if missing in the venv."""
-        if not self.project.vpy or not self.project.vpy.exists():
-            return
-
-        up = self.bash.run(
-            f'{self.project.vpy.as_posix()} -m pip install -U pip setuptools wheel',
-            timeout=self.cfg.runtime.pip_timeout_sec,
-            stream=True, prefix="[PIP] ", tee_logfile=str(self.dir_paths["logs"] / "pip_bootstrap.log")
-        )
-        # If venv has python but pip is missing, recover pip proactively.
-        if up.get("exit_code", 1) != 0 and "No module named pip" in f"{up.get('stderr','')}\n{up.get('stdout','')}":
-            self._repair_pip_in_venv(stream=True)
+        if self.project.vpy:
             up = self.bash.run(
                 f'{self.project.vpy.as_posix()} -m pip install -U pip setuptools wheel',
                 timeout=self.cfg.runtime.pip_timeout_sec,
                 stream=True, prefix="[PIP] ", tee_logfile=str(self.dir_paths["logs"] / "pip_bootstrap.log")
             )
-        self.log("venv_bootstrap", {"exit": up["exit_code"], "stderr": up["stderr"], "log": up.get("log_path")})
+            # If venv has python but pip is missing, recover pip proactively.
+            if up.get("exit_code", 1) != 0 and "No module named pip" in f"{up.get('stderr','')}\n{up.get('stdout','')}":
+                self._repair_pip_in_venv(stream=True)
+                up = self.bash.run(
+                    f'{self.project.vpy.as_posix()} -m pip install -U pip setuptools wheel',
+                    timeout=self.cfg.runtime.pip_timeout_sec,
+                    stream=True, prefix="[PIP] ", tee_logfile=str(self.dir_paths["logs"] / "pip_bootstrap.log")
+                )
+            self.log("venv_bootstrap", {"exit": up["exit_code"], "stderr": up["stderr"], "log": up.get("log_path")})
 
     def _repair_pip_in_venv(self, stream: bool = True) -> Dict[str, Any]:
         """
@@ -218,7 +182,8 @@ class GlobalOrchestrator:
         return abs_path
 
     def run_python_file(self, rel_script_path: str, timeout: Optional[int] = None, stream: bool = False,
-                        spec: Dict[str, Any] = None, prediction: Dict[str, Any] = None) -> Dict[str, Any]:
+                        spec: Dict[str, Any] = None, prediction: Dict[str, Any] = None) -> Dict[
+        str, Any]:
         abs_path = self.project_root / rel_script_path
         if not abs_path.exists():
             return {"output": "", "errors": f"No such file: {abs_path}", "exit_code": 1}
@@ -226,34 +191,8 @@ class GlobalOrchestrator:
         cmd = f'{py} "{abs_path.as_posix()}"'
         logf = (self.dir_paths["logs"] / f"run_{abs_path.stem}.log").as_posix()
 
-        # Respect per-task budget (time_budget_sec) first, then global code timeout,
-        # then global hard deadline.
-        task_budget = None
-        try:
-            if spec and isinstance(spec, dict):
-                task_budget = int(spec.get("_current_task_budget_sec") or 0) or None
-        except Exception:
-            task_budget = None
-
-        desired = None
-        if timeout is not None:
-            try:
-                desired = int(timeout)
-            except Exception:
-                desired = None
-        if desired is None:
-            # Prefer explicit task-level budget; otherwise fall back to the global
-            # code timeout. Note: task_budget is NO LONGER capped by code_timeout_sec
-            # so long-running tasks (e.g. image training) aren't artificially truncated.
-            if task_budget is not None:
-                desired = max(1, int(task_budget))
-            else:
-                desired = int(self.cfg.runtime.code_timeout_sec)
-        # Compute the absolute ceiling (run-wide remaining budget) and pass it to
-        # bash_agent.run as `hard_cap`. We deliberately DO NOT pre-clamp `desired`
-        # here: bash_agent uses the predictor to expand the soft target above
-        # `desired` when needed (heavy ML steps), then clamps by `hard_cap`.
-        hard_cap_sec: Optional[int] = None
+        # Respect global deadline for normal pipeline work, but allow bypass for the finalizer.
+        desired = int(timeout or self.cfg.runtime.code_timeout_sec)
         if not bool(getattr(self, "ignore_global_deadline", False)):
             try:
                 deadline = float(getattr(self, "global_deadline_sec", self.cfg.orchestration.total_budget_sec))
@@ -261,23 +200,8 @@ class GlobalOrchestrator:
             except Exception:
                 remaining = None
             if remaining is not None:
-                hard_cap_sec = int(remaining)
-        # Build watcher context extras: the ReAct watcher needs to know
-        # WHAT the subprocess is supposed to be doing (task text) and WHAT
-        # code is running, to decide whether observed behaviour matches intent.
-        _task_text = ""
-        try:
-            if spec and isinstance(spec, dict):
-                _task_text = str(spec.get("_current_task_text") or spec.get("task") or "")
-        except Exception:
-            _task_text = ""
-        _code_excerpt = ""
-        try:
-            _code_excerpt = abs_path.read_text(encoding="utf-8", errors="replace")[:16000]
-        except Exception:
-            _code_excerpt = ""
-        watcher_ctx_extras = {"task_text": _task_text, "code": _code_excerpt}
-
+                floor = int(getattr(self.cfg.runtime, "min_exec_timeout_sec", 10) or 10)
+                desired = min(desired, max(floor, remaining))
         res = self.bash.run(
             cmd,
             timeout=desired,
@@ -285,9 +209,7 @@ class GlobalOrchestrator:
             tee_logfile=logf,
             monitor_llm=self.monitor_llm,
             spec=spec,
-            prediction=prediction,
-            watcher_ctx_extras=watcher_ctx_extras,
-            hard_cap=hard_cap_sec,
+            prediction=prediction
         )
         self.log("python_exec", {"script": abs_path.as_posix(), "exit": res.get("exit_code")})
         return {"output": res.get("stdout", ""), "errors": res.get("stderr", ""), "exit_code": res.get("exit_code", 1)}
@@ -333,7 +255,7 @@ class GlobalOrchestrator:
                 prompt = ChatPromptTemplate.from_messages([
                     ("system",
                      "You are a Python packaging expert. Given failed pip install packages and pip error output, "
-                     "return ONLY JSON: {{\"replacements\": {{\"bad_pkg\": \"good_pkg\"}}, \"reason\": \"...\"}}. "
+                     "return ONLY JSON: {\"replacements\": {\"bad_pkg\": \"good_pkg\"}, \"reason\": \"...\"}. "
                      "Use only valid pip package names. Prefer minimal, high-confidence replacements. "
                      "If no confident replacement, return empty object."),
                     ("user",
@@ -828,39 +750,23 @@ class GlobalOrchestrator:
         """
         Delegate to helpers._record_metrics_version so index.json / ledger.csv / submission stay in sync.
         """
-        from src.helpers import (
-            _record_metrics_version as _helpers_record_metrics_version,
-            ensure_canonical_submission_copy,
-            _find_valid_submissions,
-        )
+        from src.helpers import _record_metrics_version as _helpers_record_metrics_version
 
         root = Path(self.project_root)
         sub_rel = ""
         try:
-            dest = root / self.cfg.paths.submission_dir / self.cfg.paths.submission_filename
-            # Best-effort materialization before binding submission to the version entry.
-            if not (dest.exists() and dest.stat().st_size > 0):
-                ensure_canonical_submission_copy(self)
-            # If still missing, fallback to latest valid discovered submission (header-aware).
-            if not (dest.exists() and dest.stat().st_size > 0):
-                spec_obj: Dict[str, Any] = {}
-                sp = root / self.cfg.paths.artifacts_dir / "spec.json"
-                if sp.exists():
-                    try:
-                        loaded = json.loads(sp.read_text(encoding="utf-8"))
-                        if isinstance(loaded, dict):
-                            spec_obj = loaded
-                    except Exception:
-                        spec_obj = {}
-                found = _find_valid_submissions(self, spec_obj)
-                if found:
-                    try:
-                        src = found[0][0]
-                        self.write_file(str(dest.relative_to(root)), src.read_text(encoding="utf-8", errors="ignore"))
-                    except Exception:
-                        pass
-            if dest.exists() and dest.stat().st_size > 0:
-                sub_rel = str(dest.relative_to(root))
+            _sub_candidates = [
+                root / self.cfg.paths.submission_dir / self.cfg.paths.submission_filename,
+                root / "submission.csv",
+                root / self.cfg.paths.artifacts_dir / "submissions" / "submission.csv",
+            ]
+            for _sc in _sub_candidates:
+                try:
+                    if _sc.exists() and _sc.stat().st_size > 0:
+                        sub_rel = str(_sc.relative_to(root))
+                        break
+                except Exception:
+                    continue
         except Exception:
             sub_rel = ""
         return _helpers_record_metrics_version(
@@ -894,14 +800,12 @@ class GlobalOrchestrator:
     def _read_best_or_last_metrics(self) -> dict:
         try:
             art = Path(self.project_root) / self.cfg.paths.artifacts_dir
-            for p in (
-                art / "best_metrics.json",       # written by optimizer.py
-                art / "best" / "metrics.json",   # written by helpers._record_metrics_version
-                art / "metrics_last.json",        # written by _save_last_and_maybe_best
-                art / "last" / "metrics.json",   # written by pipeline / helpers
-            ):
-                if p.exists():
-                    return json.loads(p.read_text(encoding="utf-8"))
+            bp = art / "best_metrics.json"
+            lp = art / "metrics_last.json"
+            if bp.exists():
+                return json.loads(bp.read_text(encoding="utf-8"))
+            if lp.exists():
+                return json.loads(lp.read_text(encoding="utf-8"))
         except Exception:
             pass
         return {}
@@ -951,8 +855,8 @@ class GlobalOrchestrator:
 
     def _update_markdown_plan(self) -> None:
         """
-        Regenerate task_plan.md as the main project artifact:
-        - Full tasks hierarchy and per-node overview (not truncated; tree.json remains canonical)
+        Regenerate task_plan.md as the main, compact project artifact:
+        - Tasks hierarchy and per-node overview
         - Artifacts layout and key files
         - Best/last metrics and recent experiments
         - Data/spec snapshot
@@ -972,8 +876,17 @@ class GlobalOrchestrator:
             tmp_path = root_dir / "task_plan.tmp"
 
             # -------- Tasks hierarchy & overview --------
-            # Full graph text (no truncation): large trees still live in artifacts/tree.json as JSON.
             plan_text = self.format_task_graph_to_string()
+            try:
+                plines = (plan_text or "").splitlines()
+                if len(plines) > 100:
+                    plan_text = (
+                        "\n".join(plines[:45])
+                        + "\n... [truncated middle; full graph in artifacts/tree.json] ...\n"
+                        + "\n".join(plines[-30:])
+                    )
+            except Exception:
+                pass
             tree = self._load_tree()
             nodes: Dict[str, Any] = tree.get("nodes", {}) or {}
 
@@ -1130,14 +1043,14 @@ class GlobalOrchestrator:
                 spec_snapshot_lines.append("Spec not initialized yet (spec.json missing or unreadable).")
 
             # -------- Project context & logs --------
-            # Full content, no truncation — project_context.md is already section-capped at source
-            # (see update_project_context_after_execution in pipeline.py). Cutting it again here
-            # loses acceptance criteria and data passports that agents need.
             project_context_lines: list[str] = []
             try:
                 ctx_path = self.dir_paths["artifacts"] / "project_context.md"
                 if ctx_path.exists():
                     txt = ctx_path.read_text(encoding="utf-8")
+                    if len(txt) > 1200:
+                        txt = txt[-1200:]
+                        project_context_lines.append("...(truncated)...\n")
                     project_context_lines.append(txt.strip())
                 else:
                     project_context_lines.append("No project_context.md yet.")
@@ -1186,8 +1099,9 @@ class GlobalOrchestrator:
                         n = nodes.get(active_node_id, {}) or {}
                         status = n.get("status", "")
                         kind = n.get("kind", "")
-                        # Full first line of the task (no mid-string truncation)
                         task_title = (n.get("task") or "").strip().splitlines()[0] if (n.get("task") or "").strip() else ""
+                        if len(task_title) > 140:
+                            task_title = task_title[:137] + "..."
                         decision_memory_lines.append(f"- kind={kind}, status={status}, title={task_title}")
 
                     if attempts:
@@ -1197,7 +1111,7 @@ class GlobalOrchestrator:
                                 continue
                             ph = a.get("phase", "")
                             r = a.get("route", "")
-                            reason = str(a.get("reason", ""))
+                            reason = str(a.get("reason", ""))[:160]
                             exit_code = a.get("exit_code", "")
                             decision_memory_lines.append(
                                 f"- phase={ph} route={r} exit={exit_code} reason={reason}"
@@ -1214,16 +1128,15 @@ class GlobalOrchestrator:
                 events_path = self.dir_paths["artifacts"] / "task_graph_events.jsonl"
                 if events_path.exists():
                     lines = [ln for ln in events_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-                    tail = lines[-40:] if len(lines) > 40 else lines
+                    tail = lines[-25:] if len(lines) > 25 else lines
                     for ln in tail:
                         try:
                             ev = json.loads(ln)
                             ts = str(ev.get("ts", "")).replace("T", " ").replace("Z", "").strip()
                             event = ev.get("event", "")
-                            # Full task and reason — truncation hides the replan/prune rationale
-                            task = str(ev.get("task", "") or "").replace("\n", " ")
+                            task = str(ev.get("task", "") or "")[:120]
                             nid = ev.get("node_id", "")
-                            reason = str(ev.get("reason", "") or "").replace("\n", " ")
+                            reason = str(ev.get("reason", "") or "")[:120]
                             graph_events_lines.append(f"{ts} | {event} | node={nid} | {task} | {reason}")
                         except Exception:
                             continue
@@ -1232,12 +1145,13 @@ class GlobalOrchestrator:
 
             # -------- Current direction / next steps --------
             current_dir_lines: list[str] = []
-            # 1) Try latest aggregate summary file from pipeline — full content, no truncation.
-            # This summary is the improver's main context entry; cutting it hides stack + results.
+            # 1) Try latest aggregate summary file from pipeline
             agg_path = art_dir / "aggregate_summary.md"
             if agg_path.exists():
                 try:
                     agg_txt = agg_path.read_text(encoding="utf-8")
+                    if len(agg_txt) > 2000:
+                        agg_txt = agg_txt[:2000] + "\n...(truncated)..."
                     current_dir_lines.append(agg_txt.strip())
                 except Exception:
                     pass
@@ -1279,40 +1193,6 @@ class GlobalOrchestrator:
             parts.append("```text")
             parts.append(data_tree_text)
             parts.append("```")
-
-            # -------- Canonical paths table (agent reference) --------
-            # Agents MUST use these paths — do not guess or hardcode alternatives.
-            canon_lines: list[str] = []
-            canon_lines.append("| path | exists | description |")
-            canon_lines.append("| ---- | ------ | ----------- |")
-            _art = self.cfg.paths.artifacts_dir
-            _canon_files = [
-                (f"{_art}/spec.json",                    "Task schema, data paths, metrics contract"),
-                (f"{_art}/best/metrics.json",            "Best validated metrics (primary score)"),
-                (f"{_art}/best/code.py",                 "Best solution code"),
-                (f"{_art}/best/submission.csv",          "Best submission file"),
-                (f"{_art}/last/metrics.json",            "Last run metrics"),
-                (f"{_art}/last/code.py",                 "Last run code"),
-                (f"{_art}/versions/index.json",          "Full ranked experiment history"),
-                (f"{_art}/versions/ledger.md",           "Human-readable experiments ledger"),
-            ]
-            try:
-                sub_canon = str(
-                    Path(self.cfg.paths.submission_dir) / self.cfg.paths.submission_filename
-                )
-                _canon_files.append((sub_canon, "Canonical submission output (gate output)"))
-            except Exception:
-                pass
-            for rel, desc in _canon_files:
-                exists = "✔" if (root_dir / rel).exists() else "✖"
-                canon_lines.append(f"| `{rel}` | {exists} | {desc} |")
-            parts.append("\n### 2.4 Canonical artifact paths (agent reference)\n")
-            parts.append(
-                "> **Agents**: read your paths from this table — do **not** assume flat "
-                "`best_metrics.json` or `metrics_last.json` (those are optimizer-only). "
-                "Use `artifacts/best/metrics.json` and `artifacts/last/metrics.json`.\n"
-            )
-            parts.append("\n".join(canon_lines))
 
             parts.append("\n## 3. Metrics & Experiments\n")
             parts.append(f"- Current best metric: `{best_or_last.get('primary') if best_or_last else 'N/A'}`")
@@ -1496,13 +1376,6 @@ class GlobalOrchestrator:
         n["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
         if meta:
             try:
-                # Update task description with technical artifact passport if provided
-                art_sum = meta.get("artifact_summary", "")
-                if art_sum and isinstance(art_sum, str):
-                    orig_task = n.get("task", "")
-                    if art_sum not in orig_task: # Avoid double append
-                        n["task"] = f"{orig_task}\n\n[Technical Specs]:\n{art_sum}"
-                
                 n["meta"] = {**(n.get("meta") or {}), **meta}
             except Exception:
                 pass
@@ -1564,6 +1437,29 @@ class GlobalOrchestrator:
             if not isinstance(cur, dict):
                 cur = {}
             n["meta"] = {**cur, **(meta or {})}
+            self._save_tree(t)
+        except Exception:
+            pass
+
+    def tree_update_insight(self, node_id: str, states: Dict[str, Any]) -> None:
+        if not node_id:
+            return
+        try:
+            t = self._load_tree()
+            n = t.get("nodes", {}).get(node_id)
+            if not n:
+                return
+
+            meta = n.get("meta") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+
+            cur_states = meta.get("insight_card")
+            if not isinstance(cur_states, dict):
+                cur_states = {}
+
+            meta["insight_card"] = {**cur_states, **(states or {})}
+            n["meta"] = meta
             self._save_tree(t)
         except Exception:
             pass
@@ -1662,7 +1558,7 @@ class GlobalOrchestrator:
         if not nodes:
             return None
 
-        root_id = self._tree_find_active_root() or self.tree_find_most_recent_root()
+        root_id = self._tree_find_active_root()
         if not root_id:
             return None
 
@@ -1676,23 +1572,9 @@ class GlobalOrchestrator:
             if not node:
                 continue
 
-            if prefer_kind and node.get("kind") != prefer_kind:
-                if node.get("status") == "done":
-                    children = _get_children_ordered(nodes, node_id)
-                    for child in children:
-                        cid = child["node_id"]
-                        if cid not in visited:
-                            visited.add(cid)
-                            queue.append(cid)
-                continue
-
             status = node.get("status")
 
             if status in ("pending", "running"):
-                return node_id
-
-            # Interrupted runs mark nodes failed; resume should retry this node, not skip it.
-            if status == "failed":
                 return node_id
 
             if status == "done":
@@ -1737,77 +1619,6 @@ class GlobalOrchestrator:
 
         roots_sorted = sorted(roots, key=get_ts, reverse=True)
         return roots_sorted[0]
-
-    def tree_deepest_resume_target(self, root_id: str) -> Optional[str]:
-        """
-        For --resume: choose one node under root_id to continue from.
-        Prefer the **deepest** `failed` node; if none, the deepest `pending` or `running`.
-        Same-depth tie-break: latest finished_at / updated_at, then node_id (stable).
-        """
-        t = self._load_tree()
-        nodes: Dict[str, Any] = t.get("nodes") or {}
-        if not root_id or root_id not in nodes:
-            return None
-
-        failed_rows: list[tuple[int, str, str]] = []
-        active_rows: list[tuple[int, str, str]] = []
-
-        def walk(nid: str) -> None:
-            n = nodes.get(nid)
-            if not n:
-                return
-            try:
-                depth = int(n.get("depth") or 0)
-            except (TypeError, ValueError):
-                depth = 0
-            st = str(n.get("status") or "")
-            ts = str(
-                n.get("finished_at")
-                or n.get("updated_at")
-                or n.get("started_at")
-                or n.get("created_at")
-                or ""
-            )
-            if st == "failed":
-                failed_rows.append((depth, ts, nid))
-            elif st in ("pending", "running"):
-                active_rows.append((depth, ts, nid))
-            for ch in _get_children_ordered(nodes, nid):
-                walk(ch["node_id"])
-
-        walk(root_id)
-
-        def pick(rows: list[tuple[int, str, str]]) -> Optional[str]:
-            if not rows:
-                return None
-            rows.sort(key=lambda x: (-x[0], x[1], x[2]))
-            return rows[0][2]
-
-        got = pick(failed_rows)
-        if got:
-            return got
-        return pick(active_rows)
-
-    def tree_subtree_has_unfinished_work(self, root_id: str) -> bool:
-        """True if any node under root_id is failed, pending, or running."""
-        t = self._load_tree()
-        nodes: Dict[str, Any] = t.get("nodes") or {}
-        if not root_id or root_id not in nodes:
-            return False
-
-        def walk(nid: str) -> bool:
-            n = nodes.get(nid)
-            if not n:
-                return False
-            st = str(n.get("status") or "")
-            if st in ("failed", "pending", "running"):
-                return True
-            for ch in _get_children_ordered(nodes, nid):
-                if walk(ch["node_id"]):
-                    return True
-            return False
-
-        return walk(root_id)
 
     def tree_sanitize_running_tasks(self) -> None:
         t = self._load_tree()
