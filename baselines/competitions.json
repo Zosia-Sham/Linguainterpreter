@@ -1,0 +1,26 @@
+{
+    "default_timeout": 60,
+    "competitions": [
+        { "name": "aerial-cactus-identification" },
+        { "name": "aptos2019-blindness-detection" },
+        { "name": "denoising-dirty-documents" },
+        { "name": "detecting-insults-in-social-commentary" },
+        { "name": "dog-breed-identification" },
+        { "name": "dogs-vs-cats-redux-kernels-edition" },
+        { "name": "histopathologic-cancer-detection" },
+        { "name": "jigsaw-toxic-comment-classification-challenge" },
+        { "name": "leaf-classification" },
+        { "name": "mlsp-2013-birds" },
+        { "name": "new-york-city-taxi-fare-prediction" },
+        { "name": "nomad2018-predict-transparent-conductors" },
+        { "name": "plant-pathology-2020-fgvc7" },
+        { "name": "random-acts-of-pizza" },
+        { "name": "ranzcr-clip-catheter-line-classification" },
+        { "name": "spooky-author-identification" },
+        { "name": "tabular-playground-series-dec-2021" },
+        { "name": "tabular-playground-series-may-2022" },
+        { "name": "text-normalization-challenge-english-language" },
+        { "name": "text-normalization-challenge-russian-language" },
+        { "name": "the-icml-2013-whale-challenge-right-whale-redux" }
+    ]
+}
