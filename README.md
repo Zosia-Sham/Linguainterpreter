@@ -2,6 +2,21 @@
 
 LinguaInterpreter is an autonomous framework for generating machine learning code from natural language task descriptions. The framework uses a recursive approach to parse task details and transform them into structured representations, facilitating automated machine learning workflows across various data types, including tabular, time series, text, and images. This system helps streamline code generation with minimal human intervention, making it ideal for real-world machine learning (ML) projects.
 
+> **Bachelor's thesis, HSE University, Faculty of Computer Science (2026).**
+> *A Recursive Coordination Method for Agents in a Multi-Agent System for ML Code Generation.*
+> Supervisor: Ekaterina Trofimova (HSE Laboratory of Methods for Big Data Analysis).
+>
+> This fork contains my thesis work on top of the original framework:
+> - **Insight Cards:** a deterministic diagnostics module that records a structured JSON card for
+>   every tree node on any outcome (succeeded / timed_out / failed_fixed / failed_exhausted),
+>   including time budget vs. actual runtime, attempt counts, and error diagnosis.
+> - **Automatic Evaluation Module:**
+>   - *MLE-bench Lite* (21 competitions, claude-sonnet-4.6): the system produced a valid submission
+>     for 17/21 tasks vs. 15/21 for Claude Code CLI (same model, 12h vs. 1h budget); median metric
+>     deviation ≈ 5% on the 14 tasks solved by both.
+>   - *Insight Cards vs. LLM aggregator* (4 MLE-bench Lite tasks, gemini-2.5-pro): Insight Cards
+>     diagnosed node outcomes more accurately in 75% cases.
+
 ## Features
 
 - **Recursive Parsing**: Transforms unstructured task descriptions into structured representations, isolating key parameters for a clear and actionable pipeline.
